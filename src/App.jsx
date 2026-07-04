@@ -23,16 +23,27 @@ const PROTOCOL_REGISTRY = {
   "0x0000000071727de22e5e9d8baf0edac6f37da032": "ERC-4337 EntryPoint V0.7",
 };
 
-function decodeRevertReason(data) {
+/**
+ * Decode revert data into a human-readable reason string.
+ * Handles Error(string), Panic(uint256), and ABI-decoded custom errors.
+ *
+ * @param {string} data - Raw hex revert data (may include 0x prefix)
+ * @param {object} selectorMap - Map of { [4byteHex]: abiErrorFragment } from backend
+ * @returns {{ text: string, isCustomDecoded: boolean, errorName: string|null, args: Array|null }|null}
+ */
+function decodeRevertReason(data, selectorMap = {}) {
   if (!data || data === "0x") return null;
   try {
+    // --- Standard Error(string) ---
     if (data.startsWith("0x08c379a0")) {
       const hex = data.slice(10);
       const offset = parseInt(hex.slice(0, 64), 16) * 2;
       const length = parseInt(hex.slice(offset, offset + 64), 16) * 2;
       const strHex = hex.slice(offset + 64, offset + 64 + length);
-      return decodeURIComponent(strHex.replace(/../g, "%$&")).replace(/[^\x20-\x7E]/g, "");
+      const text = decodeURIComponent(strHex.replace(/../g, "%$&")).replace(/[^\x20-\x7E]/g, "");
+      return { text, isCustomDecoded: false, errorName: null, args: null };
     }
+    // --- Panic(uint256) ---
     if (data.startsWith("0x4e487b71")) {
       const code = parseInt(data.slice(10, 74), 16);
       const panicMessages = {
@@ -42,11 +53,85 @@ function decodeRevertReason(data) {
         50: "Array index out of bounds", 65: "Memory allocation overflow",
         81: "Zero-initialized function pointer",
       };
-      return `Panic: ${panicMessages[code] || `Code ${code}`}`;
+      return { text: `Panic: ${panicMessages[code] || `Code ${code}`}`, isCustomDecoded: false, errorName: null, args: null };
     }
-    if (data.length >= 10) return `Custom error: ${data.slice(0, 10)}`;
+    // --- ABI-decoded custom error ---
+    if (data.length >= 10) {
+      const selector = data.slice(2, 10).toLowerCase(); // 4-byte hex, no 0x
+      const fragment = selectorMap[selector];
+      if (fragment) {
+        const argHex = data.slice(10); // bytes after selector
+        const decoded = decodeAbiArgs(fragment, argHex);
+        const argsStr = decoded.map(a => `${a.name}: ${a.value}`).join(", ");
+        const text = argsStr ? `${fragment.name}(${argsStr})` : fragment.name;
+        return { text, isCustomDecoded: true, errorName: fragment.name, args: decoded };
+      }
+      // Unknown selector — show raw
+      return { text: `Custom error: 0x${selector}`, isCustomDecoded: false, errorName: null, args: null };
+    }
     return null;
   } catch { return null; }
+}
+
+/**
+ * Decode ABI argument bytes for a custom error fragment.
+ * Uses a minimal inline decoder so the frontend stays self-contained.
+ * Supports: uint<N>, int<N>, address, bool, bytes<N>, string, bytes.
+ */
+function decodeAbiArgs(fragment, argHex) {
+  const inputs = (fragment.inputs || []);
+  if (inputs.length === 0 || !argHex) return [];
+
+  // Split into 32-byte (64 hex-char) words
+  const words = [];
+  for (let i = 0; i < argHex.length; i += 64) words.push(argHex.slice(i, i + 64).padEnd(64, '0'));
+
+  const results = [];
+  let headIdx = 0;
+  for (const inp of inputs) {
+    const word = words[headIdx] || '0'.repeat(64);
+    headIdx++;
+    const name = inp.name || `arg${headIdx}`;
+    const type = inp.type;
+
+    try {
+      if (type === 'string' || type === 'bytes') {
+        const offset = parseInt(word, 16) * 2;
+        const len = parseInt(argHex.slice(offset, offset + 64), 16);
+        const raw = argHex.slice(offset + 64, offset + 64 + len * 2);
+        const value = type === 'string' ? hexToUtf8(raw) : `0x${raw}`;
+        results.push({ name, type, value });
+      } else if (type === 'address') {
+        results.push({ name, type, value: `0x${word.slice(24)}` });
+      } else if (type === 'bool') {
+        results.push({ name, type, value: word.slice(-1) === '1' ? 'true' : 'false' });
+      } else if (type.startsWith('uint')) {
+        results.push({ name, type, value: BigInt(`0x${word}`).toString() });
+      } else if (type.startsWith('int')) {
+        const bits = parseInt(type.replace('int', '') || '256');
+        const raw = BigInt(`0x${word}`);
+        const max = BigInt(1) << BigInt(bits - 1);
+        const value = raw >= max ? (raw - (BigInt(1) << BigInt(bits))).toString() : raw.toString();
+        results.push({ name, type, value });
+      } else if (/^bytes\d+$/.test(type)) {
+        const byteLen = parseInt(type.replace('bytes', ''));
+        results.push({ name, type, value: `0x${word.slice(0, byteLen * 2)}` });
+      } else {
+        results.push({ name, type, value: `0x${word}` });
+      }
+    } catch {
+      results.push({ name, type, value: `0x${word}` });
+    }
+  }
+  return results;
+}
+
+function hexToUtf8(hex) {
+  try {
+    return decodeURIComponent(hex.replace(/../g, '%$&'));
+  } catch {
+    return `0x${hex}`;
+  }
 }
 
 function classifySilentFailure(gasUsed, gasLimit) {
@@ -62,9 +147,7 @@ function lookupProtocol(address) {
 }
 
 export default function App() {
-  const [etherscanKey, setEtherscanKey] = useState("");
   const [contractAddress, setContractAddress] = useState("");
-  const [showSettings, setShowSettings] = useState(false);
   const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState("");
   const [error, setError] = useState("");
@@ -83,15 +166,29 @@ export default function App() {
 
   async function fetchAndAnalyze() {
     setError(""); setIdentified([]); setSilent([]); setAnalyzed(false);
-    if (!etherscanKey.trim()) return setError("Etherscan API key is required. Open Settings.");
     if (!contractAddress.trim() || !contractAddress.startsWith("0x") || contractAddress.length !== 42)
       return setError("Enter a valid contract address (0x + 40 hex characters).");
 
     setLoading(true); setTraceActive(true);
-    setLoadingMsg("Fetching failed transactions from Etherscan...");
+    setLoadingMsg("Fetching failed transactions from backend...");
 
     try {
-      const url = `https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlist&address=${contractAddress}&startblock=0&endblock=99999999&sort=desc&page=1&offset=500&apikey=${etherscanKey}`;
+      // Fetch ABI selector map first (best-effort; does not block on failure)
+      setLoadingMsg("Fetching contract ABI...");
+      let selectorMap = {};
+      let contractVerified = false;
+      try {
+        const abiRes = await fetch(`http://localhost:5000/api/abi/${contractAddress}`);
+        if (abiRes.ok) {
+          const abiJson = await abiRes.json();
+          selectorMap = abiJson.selectors || {};
+          contractVerified = abiJson.verified || false;
+        }
+      } catch (abiErr) {
+        console.warn('ABI fetch failed, continuing without custom error decoding:', abiErr.message);
+      }
+
+      const url = `http://localhost:5000/api/transactions/${contractAddress}`;
       const res = await fetch(url);
       const json = await res.json();
 
@@ -106,23 +203,27 @@ export default function App() {
         return setError("No failed transactions found in the last 500 transactions.");
 
       const enriched = [];
-      const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
       for (let i = 0; i < Math.min(failedTxs.length, 20); i++) {
         const tx = failedTxs[i];
         setLoadingMsg(`Decoding transaction ${i + 1} of ${Math.min(failedTxs.length, 20)}...`);
-        if (i > 0) await delay(250); // Rate limiting: 250ms between calls (~4 calls/sec)
 
         let revertReason = null;
         try {
-          const blockHex = `0x${parseInt(tx.blockNumber).toString(16)}`;
-          const traceUrl = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_call&to=${tx.to}&data=${tx.input}&tag=${blockHex}&apikey=${etherscanKey}`;
-          const traceRes = await fetch(traceUrl);
+          const traceRes = await fetch('http://localhost:5000/api/trace', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              to: tx.to,
+              data: tx.input,
+              blockNumber: tx.blockNumber
+            })
+          });
           const traceJson = await traceRes.json();
           if (traceJson.result === null && traceJson.error?.message?.includes("rate")) {
             console.warn(`Rate limited on tx ${tx.hash}`);
             revertReason = null;
           } else if (traceJson.error?.data) {
-            revertReason = decodeRevertReason(traceJson.error.data);
+            revertReason = decodeRevertReason(traceJson.error.data, selectorMap);
           }
         } catch (e) { console.warn(`Trace error for tx ${tx.hash}:`, e.message); }
 
@@ -138,9 +239,11 @@ export default function App() {
           gasUsed,
           gasLimit,
           gasPercent: gasLimit > 0 ? Math.round((gasUsed / gasLimit) * 100) : 0,
-          revertReason,
+          revertReason: revertReason?.text || null,
+          revertDecoded: revertReason?.isCustomDecoded ? revertReason : null,
           silentType: !revertReason ? classifySilentFailure(gasUsed, gasLimit) : null,
           timeStamp: tx.timeStamp,
+          contractVerified,
         });
       }
 
@@ -172,6 +275,8 @@ export default function App() {
         .pill-silent { background: #2D1515; color: #FF6B6B; border: 1px solid #5C2020; }
         .pill-oog { background: #2D2415; color: #FFB347; border: 1px solid #5C4020; }
         .pill-revert { background: #1A1A2E; color: #A78BFA; border: 1px solid #3D3060; }
+        .pill-custom { background: #0D2320; color: #4FFFB0; border: 1px solid #1A5040; }
+        .pill-unverified { background: #1C1C1C; color: #64748B; border: 1px solid #2D3748; }
         input::placeholder { color: #4A5568; }
         input:focus { outline: none; border-color: #4FFFB0 !important; }
         @keyframes spin { to { transform: rotate(360deg); } }
@@ -186,37 +291,12 @@ export default function App() {
           </span>
           <span style={{ fontSize: "11px", color: "#4A5568", marginLeft: "4px", fontFamily: "'JetBrains Mono', monospace" }}>v1.0</span>
         </div>
-        <button className="btn-settings" onClick={() => setShowSettings(!showSettings)} style={{ background: showSettings ? "#1C2333" : "transparent", border: "1px solid #2D3748", color: "#8892A4", padding: "6px 14px", borderRadius: "6px", cursor: "pointer", fontSize: "13px", display: "flex", alignItems: "center", gap: "6px" }}>
-          <span>⚙</span> API Key
-        </button>
       </div>
 
       {/* Trace bar */}
       <div style={{ height: "2px", background: "#0D1220", overflow: "hidden" }}>
         <div ref={traceRef} className="trace-bar" style={{ width: "0%" }} />
       </div>
-
-      {/* Settings drawer */}
-      {showSettings && (
-        <div style={{ background: "#0D1220", borderBottom: "1px solid #1C2333", padding: "20px 24px", display: "flex", gap: "16px", alignItems: "flex-end", flexWrap: "wrap" }}>
-          <div style={{ flex: 1, minWidth: "260px" }}>
-            <label style={{ fontSize: "11px", color: "#4FFFB0", fontFamily: "'JetBrains Mono', monospace", letterSpacing: "0.08em", display: "block", marginBottom: "6px" }}>
-              ETHERSCAN API KEY
-            </label>
-            <input
-              type="password"
-              value={etherscanKey}
-              onChange={e => setEtherscanKey(e.target.value)}
-              placeholder="Paste your Etherscan key..."
-              style={{ width: "100%", background: "#0A0E1A", border: "1px solid #2D3748", color: "#E2E8F0", padding: "8px 12px", borderRadius: "6px", fontSize: "13px", fontFamily: "'JetBrains Mono', monospace" }}
-            />
-            <p style={{ fontSize: "11px", color: "#4A5568", marginTop: "4px" }}>Free key available at etherscan.io/apis</p>
-          </div>
-          <button onClick={() => setShowSettings(false)} style={{ background: "#4FFFB0", color: "#0A0E1A", border: "none", padding: "8px 18px", borderRadius: "6px", cursor: "pointer", fontSize: "13px", fontWeight: 600 }}>
-            Save & Close
-          </button>
-        </div>
-      )}
 
       {/* Main */}
       <div style={{ maxWidth: "1100px", margin: "0 auto", padding: "32px 24px" }}>
@@ -317,7 +397,7 @@ export default function App() {
         {!analyzed && !loading && !error && (
           <div style={{ textAlign: "center", padding: "60px 20px", border: "1px dashed #1C2333", borderRadius: "12px" }}>
             <div style={{ fontSize: "32px", marginBottom: "12px", opacity: 0.4 }}>⬡</div>
-            <p style={{ color: "#4A5568", fontSize: "14px" }}>Enter a contract address and your Etherscan API key to begin.</p>
+            <p style={{ color: "#4A5568", fontSize: "14px" }}>Enter a contract address to begin.</p>
             <p style={{ color: "#2D3748", fontSize: "12px", marginTop: "6px", fontFamily: "'JetBrains Mono', monospace" }}>Scans 500 transactions, analyzes up to 20 failed ones</p>
           </div>
         )}
@@ -329,6 +409,7 @@ export default function App() {
 function TxCard({ tx, border, shortHash, formatTime }) {
   const [expanded, setExpanded] = useState(false);
   const isOOG = tx.silentType?.includes("OOG");
+  const isCustomDecoded = !!tx.revertDecoded;
 
   return (
     <div className="tx-card" onClick={() => setExpanded(!expanded)} style={{ background: "#0D1220", border: `1px solid ${border}`, borderRadius: "8px", padding: "14px 16px", cursor: "pointer" }}>
@@ -338,16 +419,28 @@ function TxCard({ tx, border, shortHash, formatTime }) {
           style={{ color: "#60A5FA", textDecoration: "none", fontSize: "13px", fontFamily: "'JetBrains Mono', monospace", fontWeight: 500 }}>
           {shortHash(tx.hash)} ↗
         </a>
-        <span style={{ fontSize: "11px", color: "#4A5568" }}>{formatTime(tx.timeStamp)}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+          {/* Verification badge */}
+          {tx.revertReason && (
+            <span title={tx.contractVerified ? "Contract verified on Etherscan" : "Contract not verified"}
+              style={{ fontSize: "10px", color: tx.contractVerified ? "#4FFFB0" : "#4A5568", fontFamily: "'JetBrains Mono', monospace" }}>
+              {tx.contractVerified ? "✓ verified" : "unverified"}
+            </span>
+          )}
+          <span style={{ fontSize: "11px", color: "#4A5568" }}>{formatTime(tx.timeStamp)}</span>
+        </div>
       </div>
 
       {/* Protocol */}
       {tx.protocol && <div style={{ marginBottom: "8px" }}><span className="pill pill-protocol">{tx.protocol}</span></div>}
 
-      {/* Revert / silent */}
+      {/* Revert / silent pill */}
       <div style={{ marginBottom: "8px" }}>
         {tx.revertReason
-          ? <span className="pill pill-revert">{tx.revertReason.slice(0, 60)}{tx.revertReason.length > 60 ? "..." : ""}</span>
+          ? <span className={`pill ${isCustomDecoded ? "pill-custom" : "pill-revert"}`}>
+              {isCustomDecoded && <span style={{ marginRight: "4px", opacity: 0.7 }}>✦</span>}
+              {tx.revertReason.slice(0, 72)}{tx.revertReason.length > 72 ? "..." : ""}
+            </span>
           : <span className={`pill ${isOOG ? "pill-oog" : "pill-silent"}`}>{tx.silentType}</span>
         }
       </div>
@@ -365,10 +458,31 @@ function TxCard({ tx, border, shortHash, formatTime }) {
         </div>
       </div>
 
-      {/* Expanded: from address */}
+      {/* Expanded detail panel */}
       {expanded && (
-        <div style={{ marginTop: "10px", padding: "10px 12px", background: "#080C16", borderRadius: "6px", fontSize: "11px", color: "#4A5568", fontFamily: "'JetBrains Mono', monospace", wordBreak: "break-all" }}>
-          <span style={{ color: "#2D3748" }}>from: </span>{tx.from}
+        <div style={{ marginTop: "10px", padding: "10px 12px", background: "#080C16", borderRadius: "6px", fontSize: "11px", fontFamily: "'JetBrains Mono', monospace", wordBreak: "break-all" }}>
+          {/* from address */}
+          <div style={{ color: "#4A5568", marginBottom: isCustomDecoded && tx.revertDecoded?.args?.length ? "10px" : 0 }}>
+            <span style={{ color: "#2D3748" }}>from: </span>{tx.from}
+          </div>
+
+          {/* Decoded custom error arguments */}
+          {isCustomDecoded && tx.revertDecoded?.args?.length > 0 && (
+            <div style={{ marginTop: "6px" }}>
+              <div style={{ color: "#4FFFB0", marginBottom: "6px", fontWeight: 600, letterSpacing: "0.04em" }}>
+                {tx.revertDecoded.errorName}()
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                {tx.revertDecoded.args.map((arg, i) => (
+                  <div key={i} style={{ display: "flex", gap: "8px", alignItems: "baseline" }}>
+                    <span style={{ color: "#64748B", minWidth: "80px", flexShrink: 0 }}>{arg.name}</span>
+                    <span style={{ color: "#A78BFA", fontSize: "10px", flexShrink: 0 }}>{arg.type}</span>
+                    <span style={{ color: "#E2E8F0", wordBreak: "break-all" }}>{arg.value}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
