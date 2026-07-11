@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 
 const PROTOCOL_REGISTRY = {
-  "0x111111254eeb25477b68fb85ed929f73a960582": "1inch Aggregation Router V5",
+  "0x1111111254eeb25477b68fb85ed929f73a960582": "1inch Aggregation Router V5",
   "0x1111111254fb6c44bac0bed2854e76f90643097d": "1inch Aggregation Router V4",
   "0x111111125421ca6dc452d289314280a0f8842a65": "1inch Aggregation Router V6",
   "0xe592427a0aece92de3edee1f18e0157c05861564": "Uniswap V3 Router",
@@ -40,7 +40,7 @@ function decodeRevertReason(data, selectorMap = {}) {
       const offset = parseInt(hex.slice(0, 64), 16) * 2;
       const length = parseInt(hex.slice(offset, offset + 64), 16) * 2;
       const strHex = hex.slice(offset + 64, offset + 64 + length);
-      const text = decodeURIComponent(strHex.replace(/../g, "%$&")).replace(/[^\x20-\x7E]/g, "");
+      const text = hexToUtf8(strHex).replace(/[^\x20-\x7E]/g, "");
       return { text, isCustomDecoded: false, errorName: null, args: null };
     }
     // --- Panic(uint256) ---
@@ -91,7 +91,7 @@ function decodeAbiArgs(fragment, argHex) {
   for (const inp of inputs) {
     const word = words[headIdx] || '0'.repeat(64);
     headIdx++;
-    const name = inp.name || `arg${headIdx}`;
+    const name = inp.name || `arg${headIdx - 1}`;
     const type = inp.type;
 
     try {
@@ -135,6 +135,7 @@ function hexToUtf8(hex) {
 }
 
 function classifySilentFailure(gasUsed, gasLimit) {
+  if (!gasLimit) return "Bare revert() or custom error (no message)";
   const ratio = gasUsed / gasLimit;
   if (ratio >= 0.99) return "Likely OOG (Out of Gas)";
   if (ratio >= 0.95) return "Possible OOG";
@@ -153,19 +154,32 @@ export default function App() {
   const [error, setError] = useState("");
   const [identified, setIdentified] = useState([]);
   const [silent, setSilent] = useState([]);
+  const [totalFailed, setTotalFailed] = useState(0);
   const [analyzed, setAnalyzed] = useState(false);
   const [traceActive, setTraceActive] = useState(false);
   const traceRef = useRef(null);
+  const abortRef = useRef(null);
 
   useEffect(() => {
     if (traceActive && traceRef.current) {
+      traceRef.current.style.transition = "none";
       traceRef.current.style.width = "0%";
-      setTimeout(() => { if (traceRef.current) traceRef.current.style.width = "100%"; }, 50);
+      setTimeout(() => {
+        if (traceRef.current) {
+          traceRef.current.style.transition = "";
+          traceRef.current.style.width = "100%";
+        }
+      }, 50);
     }
   }, [traceActive]);
 
   async function fetchAndAnalyze() {
-    setError(""); setIdentified([]); setSilent([]); setAnalyzed(false);
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const { signal } = controller;
+
+    setError(""); setIdentified([]); setSilent([]); setTotalFailed(0); setAnalyzed(false);
     if (!contractAddress.trim() || !contractAddress.startsWith("0x") || contractAddress.length !== 42)
       return setError("Enter a valid contract address (0x + 40 hex characters).");
 
@@ -173,23 +187,23 @@ export default function App() {
     setLoadingMsg("Fetching failed transactions from backend...");
 
     try {
-      // Fetch ABI selector map first (best-effort; does not block on failure)
       setLoadingMsg("Fetching contract ABI...");
       let selectorMap = {};
       let contractVerified = false;
       try {
-        const abiRes = await fetch(`http://localhost:5000/api/abi/${contractAddress}`);
+        const abiRes = await fetch(`http://localhost:5000/api/abi/${contractAddress}`, { signal });
         if (abiRes.ok) {
           const abiJson = await abiRes.json();
           selectorMap = abiJson.selectors || {};
           contractVerified = abiJson.verified || false;
         }
       } catch (abiErr) {
+        if (abiErr.name === 'AbortError') throw abiErr;
         console.warn('ABI fetch failed, continuing without custom error decoding:', abiErr.message);
       }
 
       const url = `http://localhost:5000/api/transactions/${contractAddress}`;
-      const res = await fetch(url);
+      const res = await fetch(url, { signal });
       const json = await res.json();
 
       if (json.status === "0") {
@@ -201,9 +215,11 @@ export default function App() {
       const failedTxs = (json.result || []).filter(tx => tx.isError === "1");
       if (failedTxs.length === 0)
         return setError("No failed transactions found in the last 500 transactions.");
+      setTotalFailed(failedTxs.length);
 
       const enriched = [];
       for (let i = 0; i < Math.min(failedTxs.length, 20); i++) {
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
         const tx = failedTxs[i];
         setLoadingMsg(`Decoding transaction ${i + 1} of ${Math.min(failedTxs.length, 20)}...`);
 
@@ -216,7 +232,8 @@ export default function App() {
               to: tx.to,
               data: tx.input,
               blockNumber: tx.blockNumber
-            })
+            }),
+            signal,
           });
           const traceJson = await traceRes.json();
           if (traceJson.result === null && traceJson.error?.message?.includes("rate")) {
@@ -225,7 +242,10 @@ export default function App() {
           } else if (traceJson.error?.data) {
             revertReason = decodeRevertReason(traceJson.error.data, selectorMap);
           }
-        } catch (e) { console.warn(`Trace error for tx ${tx.hash}:`, e.message); }
+        } catch (e) {
+          if (e.name === 'AbortError') throw e;
+          console.warn(`Trace error for tx ${tx.hash}:`, e.message);
+        }
 
         const gasUsed = parseInt(tx.gasUsed);
         const gasLimit = parseInt(tx.gas);
@@ -251,9 +271,13 @@ export default function App() {
       setSilent(enriched.filter(tx => !tx.revertReason));
       setAnalyzed(true);
     } catch (err) {
+      if (err.name === 'AbortError') return;
       setError(`Error: ${err.message}`);
     } finally {
-      setLoading(false); setTraceActive(false);
+      if (abortRef.current === controller) {
+        setLoading(false); setTraceActive(false);
+        abortRef.current = null;
+      }
     }
   }
 
@@ -358,7 +382,7 @@ export default function App() {
             {/* Summary */}
             <div style={{ display: "flex", gap: "16px", marginBottom: "28px", flexWrap: "wrap" }}>
               {[
-                { label: "Total Failed", value: identified.length + silent.length, color: "#E2E8F0" },
+                { label: `Total Failed${totalFailed > identified.length + silent.length ? ` (${identified.length + silent.length} analyzed)` : ""}`, value: totalFailed, color: "#E2E8F0" },
                 { label: "Decoded Failures", value: identified.length, color: "#4FFFB0" },
                 { label: "Silent Failures", value: silent.length, color: "#FF6B6B" },
               ].map(({ label, value, color }) => (
