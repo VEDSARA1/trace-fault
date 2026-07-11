@@ -1,71 +1,43 @@
-# Tracefault (React + Express)
+# TraceFault
 
-Tracefault is a full-stack Failed Transaction Analyzer. It features a Vite/React frontend and a Node.js/Express backend that securely proxies Etherscan API requests.
+**Why did my transaction fail?**
 
-## Architecture
+Paste an Ethereum contract address. TraceFault pulls its recent failed transactions and tells you, in plain language, why each one broke — the actual revert reason, the custom error and its arguments, or (when the chain won't say) an educated guess based on gas usage.
 
+## What it shows you
+
+- **Decoded reverts** — instead of `0x7939f424`, you see `SafeTransferFromFailed()` with named arguments.
+- **Silent failures** — when a transaction ran out of gas or reverted without a message, it says so.
+- **Protocol tags** — recognizes Uniswap, Aave, 1inch, Seaport, and other common contracts so you know what you're looking at.
+- **Verification badge** — shows whether the contract's source is public on Etherscan.
+
+## Try it
+
+You need a free [Etherscan API key](https://etherscan.io/myapikey).
+
+**Backend** (in `/backend`):
+
+```bash
+npm install
+cp .env.example .env      # then paste your API key into .env
+npm run dev
 ```
-React Frontend (localhost:5173)
-        │
-        ▼ (REST API)
-Express Backend (localhost:5000)
-        │
-        ▼
-Etherscan API
+
+**Frontend** (in the project root):
+
+```bash
+npm install
+npm run dev
 ```
 
-## Running Locally
+Open http://localhost:5173, drop in any contract address (or hit one of the quick-fill buttons), and click Analyze.
 
-### Backend Setup
+## Deploying it
 
-1. Navigate to the `backend` directory:
-   ```bash
-   cd backend
-   ```
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Copy the environment variables template and add your Etherscan API key:
-   ```bash
-   cp .env.example .env
-   ```
-4. Start the backend server:
-   ```bash
-   npm run dev
-   # or npm start
-   ```
+- Put your production Etherscan key in the backend's environment.
+- Set `FRONTEND_ORIGIN` on the backend to your live frontend URL.
+- Replace the hardcoded `http://localhost:5000` in `src/App.jsx` with your production API URL before running `npm run build`.
 
-### Frontend Setup
+## How it works (in one paragraph)
 
-1. From the project root, install dependencies:
-   ```bash
-   npm install
-   ```
-2. Start the Vite dev server:
-   ```bash
-   npm run dev
-   ```
-
-The application frontend will be available at `http://localhost:5173` and will communicate with the backend running on `http://localhost:5000`.
-
-## Features
-
-- **Standard revert decoding**: `Error(string)` and `Panic(uint256)` are decoded client-side.
-- **Custom error decoding**: For verified contracts, the backend fetches the ABI and decodes custom Solidity errors into human-readable `ErrorName(param: value, ...)` format including full argument names and types.
-- **Fallback to raw selector**: Unverified contracts still show the 4-byte selector.
-- **Verification badge**: Each decoded failure shows whether the contract ABI was available.
-- **Silent failure classification**: Out-of-gas and bare reverts are detected from gas ratio.
-- **Protocol recognition**: Identifies known DeFi protocols (Uniswap, Aave, 1inch, Seaport, etc.) by address.
-
-## Production Deployment
-
-When deploying to production, ensure that:
-1. The backend is configured with the production `ETHERSCAN_API_KEY`.
-2. The backend `FRONTEND_ORIGIN` environment variable is updated to match your live frontend URL.
-3. The frontend is built using `npm run build` and the `http://localhost:5000` URLs in `App.jsx` are replaced with your production API URL (or use environment variables for this).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
-
+The frontend asks the Express backend for a contract's recent transactions. The backend proxies Etherscan calls (throttled and cached) and, for verified contracts, hands back a map of custom-error selectors. For each failed transaction, the frontend replays the call at its original block via `eth_call` to pull the revert data, then decodes it against the ABI selectors. Transactions that don't return a revert reason are classified by how much of their gas they burned.
