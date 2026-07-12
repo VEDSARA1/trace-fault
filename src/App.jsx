@@ -196,6 +196,11 @@ export default function App() {
           const abiJson = await abiRes.json();
           selectorMap = abiJson.selectors || {};
           contractVerified = abiJson.verified || false;
+        } else if (abiRes.status === 429) {
+          // Best-effort: skip ABI decoding this run rather than retrying into the rate limit.
+          console.warn('ABI fetch rate-limited (429); continuing without custom error decoding.');
+        } else {
+          console.warn(`ABI fetch failed (status ${abiRes.status}); continuing without custom error decoding.`);
         }
       } catch (abiErr) {
         if (abiErr.name === 'AbortError') throw abiErr;
@@ -204,6 +209,15 @@ export default function App() {
 
       const url = `http://localhost:5000/api/transactions/${contractAddress}`;
       const res = await fetch(url, { signal });
+
+      if (!res.ok) {
+        if (res.status === 429)
+          return setError("Etherscan rate-limited the backend. Please wait a moment and try again.");
+        if (res.status === 500)
+          return setError("Something went wrong on our end. Please try again shortly.");
+        return setError("The backend couldn't reach Etherscan. Please try again shortly.");
+      }
+
       const json = await res.json();
 
       if (json.status === "0") {
@@ -235,12 +249,22 @@ export default function App() {
             }),
             signal,
           });
-          const traceJson = await traceRes.json();
-          if (traceJson.result === null && traceJson.error?.message?.includes("rate")) {
-            console.warn(`Rate limited on tx ${tx.hash}`);
+          // Our backend surfaces failures as distinct HTTP statuses. One bad trace
+          // shouldn't kill the whole analysis — warn accurately and leave this tx as silent.
+          if (!traceRes.ok) {
+            if (traceRes.status === 429)
+              console.warn(`Trace rate-limited (429) on tx ${tx.hash}; leaving as silent.`);
+            else
+              console.warn(`Trace request failed (status ${traceRes.status}) on tx ${tx.hash}; leaving as silent.`);
             revertReason = null;
-          } else if (traceJson.error?.data) {
-            revertReason = decodeRevertReason(traceJson.error.data, selectorMap);
+          } else {
+            const traceJson = await traceRes.json();
+            if (traceJson.result === null && traceJson.error?.message?.includes("rate")) {
+              console.warn(`Rate limited on tx ${tx.hash}`);
+              revertReason = null;
+            } else if (traceJson.error?.data) {
+              revertReason = decodeRevertReason(traceJson.error.data, selectorMap);
+            }
           }
         } catch (e) {
           if (e.name === 'AbortError') throw e;
