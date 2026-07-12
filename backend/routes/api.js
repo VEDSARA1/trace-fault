@@ -6,7 +6,6 @@ import {
   getAbi,
   ConfigError,
   RateLimitError,
-  EtherscanError,
 } from '../services/etherscanService.js';
 import { buildErrorSelectorMap } from '../utils/abiDecoder.js';
 

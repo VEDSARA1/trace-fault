@@ -78,10 +78,18 @@ function looksLikeRateLimit(json) {
 
 const fetchFromEtherscan = async (url) => {
   let response;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+
   try {
-    response = await fetch(url);
+    response = await fetch(url, { signal: controller.signal });
   } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new EtherscanError('Request to Etherscan timed out after 10s');
+    }
     throw new EtherscanError(`Network error contacting Etherscan: ${err.message}`);
+  } finally {
+    clearTimeout(timeoutId);
   }
 
   if (response.status === 429) {
@@ -120,9 +128,14 @@ export const getTransactions = async (address) => {
 export const getTrace = async (to, data, blockNumber) => {
   const apiKey = requireApiKey();
 
-  let blockHex = blockNumber;
+  let blockHex = String(blockNumber);
   if (!blockHex.startsWith('0x')) {
-    blockHex = `0x${parseInt(blockNumber, 10).toString(16)}`;
+    try {
+      blockHex = `0x${BigInt(blockHex).toString(16)}`;
+    } catch {
+      // Fallback in case of unexpected format
+      blockHex = '0x0';
+    }
   }
 
   const traceUrl = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_call&to=${to}&data=${data}&tag=${blockHex}&apikey=${apiKey}`;
@@ -136,24 +149,33 @@ export const getTrace = async (to, data, blockNumber) => {
  */
 export const getAbi = async (address) => {
   const key = address.toLowerCase();
-  if (abiCache.has(key)) return abiCache.get(key);
+  if (abiCache.has(key)) return await abiCache.get(key);
 
-  const apiKey = requireApiKey();
-  const url = `https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getabi&address=${address}&apikey=${apiKey}`;
+  const fetchPromise = (async () => {
+    const apiKey = requireApiKey();
+    const url = `https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getabi&address=${address}&apikey=${apiKey}`;
 
-  const json = await etherscanQueue.enqueue(() => fetchFromEtherscan(url));
+    const json = await etherscanQueue.enqueue(() => fetchFromEtherscan(url));
 
-  if (json.status !== '1' || !json.result || json.result === 'Contract source code not verified') {
-    abiCache.set(key, null);
-    return null;
-  }
+    if (json.status !== '1' || !json.result || json.result === 'Contract source code not verified') {
+      return null;
+    }
 
-  let parsed;
+    try {
+      return JSON.parse(json.result);
+    } catch (err) {
+      throw new EtherscanError(`Etherscan returned malformed ABI JSON: ${err.message}`);
+    }
+  })();
+
+  abiCache.set(key, fetchPromise);
+
   try {
-    parsed = JSON.parse(json.result);
+    const result = await fetchPromise;
+    abiCache.set(key, result);
+    return result;
   } catch (err) {
-    throw new EtherscanError(`Etherscan returned malformed ABI JSON: ${err.message}`);
+    abiCache.delete(key);
+    throw err;
   }
-  abiCache.set(key, parsed);
-  return parsed;
 };
