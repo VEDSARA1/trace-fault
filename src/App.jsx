@@ -1,5 +1,9 @@
 import { useState, useRef, useEffect } from "react";
 
+// Backend URL — set VITE_API_URL in your deployment environment.
+// Falls back to localhost for local development.
+const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:5000";
+
 const PROTOCOL_REGISTRY = {
   "0x1111111254eeb25477b68fb85ed929f73a960582": "1inch Aggregation Router V5",
   "0x1111111254fb6c44bac0bed2854e76f90643097d": "1inch Aggregation Router V4",
@@ -191,7 +195,7 @@ export default function App() {
       let selectorMap = {};
       let contractVerified = false;
       try {
-        const abiRes = await fetch(`http://localhost:5000/api/abi/${contractAddress}`, { signal });
+        const abiRes = await fetch(`${API_BASE}/api/abi/${contractAddress}`, { signal });
         if (abiRes.ok) {
           const abiJson = await abiRes.json();
           selectorMap = abiJson.selectors || {};
@@ -207,7 +211,7 @@ export default function App() {
         console.warn('ABI fetch failed, continuing without custom error decoding:', abiErr.message);
       }
 
-      const url = `http://localhost:5000/api/transactions/${contractAddress}`;
+      const url = `${API_BASE}/api/transactions/${contractAddress}`;
       const res = await fetch(url, { signal });
 
       if (!res.ok) {
@@ -239,7 +243,7 @@ export default function App() {
 
         let revertReason = null;
         try {
-          const traceRes = await fetch('http://localhost:5000/api/trace', {
+          const traceRes = await fetch(`${API_BASE}/api/trace`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({

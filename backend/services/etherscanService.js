@@ -132,9 +132,12 @@ export const getTrace = async (to, data, blockNumber) => {
   if (!blockHex.startsWith('0x')) {
     try {
       blockHex = `0x${BigInt(blockHex).toString(16)}`;
-    } catch {
-      // Fallback in case of unexpected format
-      blockHex = '0x0';
+    } catch (err) {
+      // Do NOT silently fall back to block 0 — that would send a real request
+      // for the wrong block with no indication anything was wrong. Validation
+      // upstream (validateTrace) should prevent this from ever happening, but
+      // if it's ever reached anyway, fail loudly instead of guessing.
+      throw new EtherscanError(`Invalid blockNumber "${blockNumber}": ${err.message}`);
     }
   }
 
