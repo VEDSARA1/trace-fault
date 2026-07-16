@@ -28,15 +28,30 @@ export class EtherscanError extends Error {
 const abiCache = new Map();
 
 class RequestQueue {
-  constructor(delayMs) {
+  /**
+   * @param {number} delayMs   Spacing enforced between successive requests.
+   * @param {object} [opts]
+   * @param {number} [opts.maxQueue]   Max tasks allowed to wait; beyond this, enqueue is rejected (backpressure).
+   * @param {number} [opts.maxWaitMs]  Max time a task may sit queued before it starts; exceeded → rejected.
+   */
+  constructor(delayMs, { maxQueue = 50, maxWaitMs = 15000 } = {}) {
     this.delayMs = delayMs;
+    this.maxQueue = maxQueue;
+    this.maxWaitMs = maxWaitMs;
     this.queue = [];
     this.isProcessing = false;
   }
 
   enqueue(task) {
     return new Promise((resolve, reject) => {
-      this.queue.push({ task, resolve, reject });
+      // Backpressure: don't let the queue grow without bound. A caller that
+      // arrives when we're already saturated fails fast with a rate-limit
+      // signal rather than waiting an unbounded amount of time.
+      if (this.queue.length >= this.maxQueue) {
+        reject(new RateLimitError('Server is busy (request queue full). Please retry shortly.'));
+        return;
+      }
+      this.queue.push({ task, resolve, reject, enqueuedAt: Date.now() });
       this.processQueue();
     });
   }
@@ -46,7 +61,16 @@ class RequestQueue {
     this.isProcessing = true;
 
     while (this.queue.length > 0) {
-      const { task, resolve, reject } = this.queue.shift();
+      const { task, resolve, reject, enqueuedAt } = this.queue.shift();
+
+      // The per-request fetch timeout only starts once a task RUNS. A task that
+      // waited too long in line would otherwise hang the client far past that
+      // timeout, so drop it here instead of starting a now-stale request.
+      if (Date.now() - enqueuedAt > this.maxWaitMs) {
+        reject(new EtherscanError('Timed out waiting in the request queue.'));
+        continue;
+      }
+
       try {
         const result = await task();
         resolve(result);

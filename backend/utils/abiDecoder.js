@@ -40,7 +40,7 @@ export function buildErrorSelectorMap(abi) {
     try {
       const selector = errorSelector(entry);
       map.set(selector.toLowerCase(), entry);
-    } catch (e) {
+    } catch {
       // Skip malformed or unsupported ABI entries
     }
   }
@@ -95,7 +95,7 @@ function formatDecodedValue(value, type) {
     if (typeof value === 'boolean') return String(value);
     if (typeof value === 'string') return value;
     if (type === 'address') return String(value).toLowerCase();
-    if (Array.isArray(value)) return `[${value.map((v, i) => formatDecodedValue(v, '')).join(', ')}]`;
+    if (Array.isArray(value)) return `[${value.map((v) => formatDecodedValue(v, '')).join(', ')}]`;
     // Bytes types come back as Uint8Array / hex string from ethers
     return String(value);
   } catch {
