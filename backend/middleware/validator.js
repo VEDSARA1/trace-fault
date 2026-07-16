@@ -6,6 +6,14 @@ export const validateAddress = (req, res, next) => {
   next();
 };
 
+export const validateHash = (req, res, next) => {
+  const { hash } = req.params;
+  if (typeof hash !== 'string' || !/^0x[a-fA-F0-9]{64}$/.test(hash)) {
+    return res.status(400).json({ error: 'Invalid transaction hash.' });
+  }
+  next();
+};
+
 export const validateTrace = (req, res, next) => {
   const { to, data, blockNumber } = req.body || {};
   if (typeof to !== 'string' || !/^0x[a-fA-F0-9]{40}$/.test(to)) {

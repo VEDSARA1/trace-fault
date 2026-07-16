@@ -22,10 +22,18 @@ export class EtherscanError extends Error {
   }
 }
 
-// address (lowercase) → parsed ABI array | null
-// null means the contract was checked and is confirmed unverified.
-// Transient errors are NOT cached — they should be retried on the next call.
+// ABI cache. key = address (lowercase) → one of:
+//   { promise }              an in-flight fetch (concurrent callers dedup on it)
+//   { value, expiresAt }     a resolved result
+//
+// value is a parsed ABI array (verified) or null (confirmed unverified).
+// expiresAt is null for verified ABIs — contract bytecode is immutable, so a
+// verified ABI never goes stale and is cached for the process lifetime. null
+// (unverified) entries carry a timestamp and expire after UNVERIFIED_TTL_MS, so
+// a contract that gets verified later is eventually picked up on re-fetch.
+// Transient errors are NEVER cached — they should be retried on the next call.
 const abiCache = new Map();
+const UNVERIFIED_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 class RequestQueue {
   /**
@@ -94,9 +102,18 @@ const etherscanQueue = new RequestQueue(250);
 const RATE_LIMIT_RX = /rate limit|max calls per sec|max rate/i;
 function looksLikeRateLimit(json) {
   if (!json) return false;
+  // Etherscan signals throttling with an error-shaped response — status "0"
+  // (the NOTOK envelope it uses across REST *and* the proxy/eth_call module) —
+  // carrying the rate-limit text in `message` or `result`.
+  //
+  // We deliberately gate on status "0" and do NOT inspect `json.error.message`
+  // or a success-body `result`: for eth_call those hold the contract's own
+  // revert reason / return data, which is arbitrary and could legitimately
+  // contain "rate limit" (e.g. a revert string, or an ABI error named
+  // RateLimitExceeded), causing a false 429.
+  if (json.status !== '0') return false;
   if (typeof json.result === 'string' && RATE_LIMIT_RX.test(json.result)) return true;
   if (typeof json.message === 'string' && RATE_LIMIT_RX.test(json.message)) return true;
-  if (typeof json.error?.message === 'string' && RATE_LIMIT_RX.test(json.error.message)) return true;
   return false;
 }
 
@@ -170,13 +187,45 @@ export const getTrace = async (to, data, blockNumber) => {
 };
 
 /**
+ * Fetch a transaction receipt (eth_getTransactionReceipt).
+ * Returns the JSON-RPC envelope; `result` is null if the hash is unknown.
+ */
+export const getTransactionReceipt = async (hash) => {
+  const apiKey = requireApiKey();
+  const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getTransactionReceipt&txhash=${hash}&apikey=${apiKey}`;
+  return etherscanQueue.enqueue(() => fetchFromEtherscan(url));
+};
+
+/**
+ * Fetch a transaction by hash (eth_getTransactionByHash).
+ * Returns the JSON-RPC envelope; `result` is null if the hash is unknown.
+ */
+export const getTransactionByHash = async (hash) => {
+  const apiKey = requireApiKey();
+  const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getTransactionByHash&txhash=${hash}&apikey=${apiKey}`;
+  return etherscanQueue.enqueue(() => fetchFromEtherscan(url));
+};
+
+/**
  * Fetch the verified ABI for a contract from Etherscan.
  * Returns a parsed ABI array, or null if the contract is confirmed unverified.
  * Throws ConfigError / RateLimitError / EtherscanError on failure — nothing is cached in that case.
  */
 export const getAbi = async (address) => {
   const key = address.toLowerCase();
-  if (abiCache.has(key)) return await abiCache.get(key);
+
+  const cached = abiCache.get(key);
+  if (cached) {
+    // In-flight fetch: dedup by awaiting the same promise.
+    if (cached.promise) return await cached.promise;
+    // Resolved: verified entries never expire (expiresAt null); unverified
+    // entries are honored until their TTL lapses.
+    if (cached.expiresAt === null || cached.expiresAt > Date.now()) {
+      return cached.value;
+    }
+    // Stale unverified entry — drop it and re-fetch below.
+    abiCache.delete(key);
+  }
 
   const fetchPromise = (async () => {
     const apiKey = requireApiKey();
@@ -195,11 +244,13 @@ export const getAbi = async (address) => {
     }
   })();
 
-  abiCache.set(key, fetchPromise);
+  abiCache.set(key, { promise: fetchPromise });
 
   try {
     const result = await fetchPromise;
-    abiCache.set(key, result);
+    // Verified (array) → cache forever; unverified (null) → 24h TTL.
+    const expiresAt = result === null ? Date.now() + UNVERIFIED_TTL_MS : null;
+    abiCache.set(key, { value: result, expiresAt });
     return result;
   } catch (err) {
     abiCache.delete(key);

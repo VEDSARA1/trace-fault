@@ -151,6 +151,25 @@ function lookupProtocol(address) {
   return PROTOCOL_REGISTRY[address.toLowerCase()] || null;
 }
 
+// Format a wei amount (decimal string) into a readable ETH string.
+function formatEth(wei) {
+  try {
+    const eth = Number(BigInt(wei)) / 1e18;
+    if (eth === 0) return "0";
+    if (eth < 0.00001) return eth.toExponential(2);
+    return eth.toLocaleString(undefined, { maximumFractionDigits: 6 });
+  } catch {
+    return "—";
+  }
+}
+
+function txTypeLabel(type) {
+  if (type === 0) return "legacy (0)";
+  if (type === 1) return "EIP-2930 (1)";
+  if (type === 2) return "EIP-1559 (2)";
+  return type == null ? "—" : `type ${type}`;
+}
+
 export default function App() {
   const [contractAddress, setContractAddress] = useState("");
   const [loading, setLoading] = useState(false);
@@ -460,8 +479,36 @@ export default function App() {
 
 function TxCard({ tx, border, shortHash, formatTime }) {
   const [expanded, setExpanded] = useState(false);
+  const [enrich, setEnrich] = useState(null);
+  const [enrichLoading, setEnrichLoading] = useState(false);
+  const [enrichError, setEnrichError] = useState("");
+  const enrichFetchedRef = useRef(false);
   const isOOG = tx.silentType?.includes("OOG");
   const isCustomDecoded = !!tx.revertDecoded;
+
+  // Lazy enrichment: fetch receipt + tx-by-hash only the first time this card
+  // is expanded, so we don't spend Etherscan calls on cards nobody opens.
+  // A ref guards against re-fetching; the effect depends only on expand/hash so
+  // toggling loading state can't re-trigger and cancel the in-flight request.
+  useEffect(() => {
+    if (!expanded || enrichFetchedRef.current) return;
+    enrichFetchedRef.current = true;
+    (async () => {
+      setEnrichLoading(true); setEnrichError("");
+      try {
+        const res = await fetch(`${API_BASE}/api/enrich/${tx.hash}`);
+        if (!res.ok) {
+          setEnrichError(res.status === 429 ? "Rate-limited — try again shortly." : "Couldn't load transaction details.");
+          return;
+        }
+        setEnrich(await res.json());
+      } catch {
+        setEnrichError("Couldn't load transaction details.");
+      } finally {
+        setEnrichLoading(false);
+      }
+    })();
+  }, [expanded, tx.hash]);
 
   return (
     <div className="tx-card" onClick={() => setExpanded(!expanded)} style={{ background: "#0D1220", border: `1px solid ${border}`, borderRadius: "8px", padding: "14px 16px", cursor: "pointer" }}>
@@ -535,6 +582,28 @@ function TxCard({ tx, border, shortHash, formatTime }) {
               </div>
             </div>
           )}
+
+          {/* Lazy on-chain enrichment: receipt + tx-by-hash */}
+          <div style={{ marginTop: "10px", borderTop: "1px solid #16202E", paddingTop: "10px" }}>
+            {enrichLoading && <div style={{ color: "#4A5568" }}>Loading on-chain details…</div>}
+            {enrichError && <div style={{ color: "#FF6B6B" }}>{enrichError}</div>}
+            {enrich && (
+              <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
+                {[
+                  { label: "gas burned", value: enrich.gasBurnedWei ? `${formatEth(enrich.gasBurnedWei)} ETH` : "—", color: "#FFB347" },
+                  { label: "value sent", value: `${formatEth(enrich.valueWei || "0")} ETH`, color: "#E2E8F0" },
+                  { label: "nonce", value: enrich.nonce ?? "—", color: "#E2E8F0" },
+                  { label: "tx type", value: txTypeLabel(enrich.txType), color: "#E2E8F0" },
+                  { label: "receipt", value: enrich.status === "0x0" ? "failed (0x0)" : enrich.status === "0x1" ? "success (0x1)" : "—", color: enrich.status === "0x0" ? "#FF6B6B" : "#E2E8F0" },
+                ].map(({ label, value, color }) => (
+                  <div key={label} style={{ display: "flex", gap: "8px", alignItems: "baseline" }}>
+                    <span style={{ color: "#64748B", minWidth: "80px", flexShrink: 0 }}>{label}</span>
+                    <span style={{ color, wordBreak: "break-all" }}>{value}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
