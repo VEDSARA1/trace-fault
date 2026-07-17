@@ -166,23 +166,40 @@ export const getTransactions = async (address) => {
   return etherscanQueue.enqueue(() => fetchFromEtherscan(url));
 };
 
-export const getTrace = async (to, data, blockNumber) => {
-  const apiKey = requireApiKey();
-
-  let blockHex = String(blockNumber);
-  if (!blockHex.startsWith('0x')) {
+// Normalize a decimal-or-hex quantity string to 0x-hex. Shared by blockNumber
+// and gas so both encode identically. Throws EtherscanError on garbage input —
+// do NOT silently fall back to a default: that would send a real request with
+// the wrong value and no indication anything was wrong. Validation upstream
+// (validateTrace) should prevent this from ever happening, but if it's ever
+// reached anyway, fail loudly instead of guessing.
+function toHexQuantity(value, label) {
+  let hex = String(value);
+  if (!hex.startsWith('0x')) {
     try {
-      blockHex = `0x${BigInt(blockHex).toString(16)}`;
+      hex = `0x${BigInt(hex).toString(16)}`;
     } catch (err) {
-      // Do NOT silently fall back to block 0 — that would send a real request
-      // for the wrong block with no indication anything was wrong. Validation
-      // upstream (validateTrace) should prevent this from ever happening, but
-      // if it's ever reached anyway, fail loudly instead of guessing.
-      throw new EtherscanError(`Invalid blockNumber "${blockNumber}": ${err.message}`);
+      throw new EtherscanError(`Invalid ${label} "${value}": ${err.message}`);
     }
   }
+  return hex;
+}
 
-  const traceUrl = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_call&to=${to}&data=${data}&tag=${blockHex}&apikey=${apiKey}`;
+export const getTrace = async (to, data, blockNumber, from, gas) => {
+  const apiKey = requireApiKey();
+
+  const blockHex = toHexQuantity(blockNumber, 'blockNumber');
+
+  // Replay fidelity: forward the original sender so msg.sender-gated paths
+  // (onlyOwner etc.) reproduce the real revert instead of running as 0x0.
+  // Both params are optional — when absent the URL is byte-for-byte what it
+  // was before they existed. Deliberately NOT forwarding `value`: some nodes
+  // validate value against the sender's CURRENT balance in eth_call and would
+  // inject false "insufficient balance" reverts.
+  let extra = '';
+  if (from) extra += `&from=${from}`;
+  if (gas) extra += `&gas=${toHexQuantity(gas, 'gas')}`;
+
+  const traceUrl = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_call&to=${to}&data=${data}&tag=${blockHex}${extra}&apikey=${apiKey}`;
   return etherscanQueue.enqueue(() => fetchFromEtherscan(traceUrl));
 };
 

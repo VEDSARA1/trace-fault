@@ -256,9 +256,21 @@ export default function App() {
         throw new Error(json.result || json.message);
       }
 
-      const failedTxs = (json.result || []).filter(tx => tx.isError === "1");
-      if (failedTxs.length === 0)
+      const allFailed = (json.result || []).filter(tx => tx.isError === "1");
+      // Contract creations come back with an empty `to` (and a populated
+      // contractAddress). They have no callee to replay via eth_call, and
+      // semantically they're deployments BY this address, not failed calls TO
+      // it — so they're excluded from analysis entirely.
+      const failedTxs = allFailed.filter(tx => tx.to && tx.to !== "");
+      const skippedCreations = allFailed.length - failedTxs.length;
+      if (skippedCreations > 0)
+        console.info(`Skipped ${skippedCreations} contract-creation tx(s) — not traceable`);
+      if (allFailed.length === 0)
         return setError("No failed transactions found in the last 500 transactions.");
+      if (failedTxs.length === 0)
+        return setError("Only contract-creation failures found — nothing to trace.");
+      // totalFailed deliberately counts analyzable failed CALLS (creations
+      // excluded) so the summary matches what the analysis can actually show.
       setTotalFailed(failedTxs.length);
 
       const enriched = [];
@@ -287,7 +299,11 @@ export default function App() {
               body: JSON.stringify({
                 to: tx.to,
                 data: tx.input,
-                blockNumber: tx.blockNumber
+                blockNumber: tx.blockNumber,
+                // Replay fidelity: forward sender + gas so msg.sender-gated
+                // reverts reproduce correctly (backend treats both as optional).
+                from: tx.from,
+                gas: tx.gas
               }),
               signal,
             });

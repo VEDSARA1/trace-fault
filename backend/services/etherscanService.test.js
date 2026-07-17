@@ -92,6 +92,50 @@ describe('etherscanService — ABI caching', () => {
     });
 });
 
+describe('etherscanService — getTrace replay params', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        process.env.ETHERSCAN_API_KEY = 'test-key';
+    });
+
+    afterEach(() => {
+        delete process.env.ETHERSCAN_API_KEY;
+    });
+
+    const TO = '0x1111111111111111111111111111111111111111';
+    const FROM = '0x9145da2c4a2d3dea910006a7861d29e219fd2d58';
+    const ok = () => ({ ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: 1, result: '0x' }) });
+    const calledUrl = () => fetchMock.mock.calls[0][0];
+
+    it('builds the exact legacy URL when from/gas are not passed', async () => {
+        fetchMock.mockResolvedValueOnce(ok());
+        await getTrace(TO, '0xabc123', '18500000');
+        expect(calledUrl()).toBe(
+            `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_call&to=${TO}&data=0xabc123&tag=0x11a49a0&apikey=test-key`
+        );
+    });
+
+    it('appends &from= when a sender is passed', async () => {
+        fetchMock.mockResolvedValueOnce(ok());
+        await getTrace(TO, '0xabc123', '18500000', FROM);
+        expect(calledUrl()).toBe(
+            `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_call&to=${TO}&data=0xabc123&tag=0x11a49a0&from=${FROM}&apikey=test-key`
+        );
+    });
+
+    it('hex-encodes decimal gas the same way blockNumber is encoded', async () => {
+        fetchMock.mockResolvedValueOnce(ok());
+        await getTrace(TO, '0xabc123', '18500000', FROM, '100000');
+        expect(calledUrl()).toContain('&gas=0x186a0&');
+    });
+
+    it('passes 0x-hex gas through unchanged', async () => {
+        fetchMock.mockResolvedValueOnce(ok());
+        await getTrace(TO, '0xabc123', '0x1', FROM, '0x186a0');
+        expect(calledUrl()).toContain('&gas=0x186a0&');
+    });
+});
+
 describe('etherscanService — rate-limit detection', () => {
     beforeEach(() => {
         vi.clearAllMocks();

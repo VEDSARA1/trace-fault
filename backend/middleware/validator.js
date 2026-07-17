@@ -28,5 +28,20 @@ export const validateTrace = (req, res, next) => {
   }
   // Normalize blockNumber to string to prevent TypeError in downstream services
   req.body.blockNumber = blockNumberStr;
+
+  // Optional replay-fidelity fields: absent is fine; present-but-malformed is a 400.
+  const { from, gas } = req.body;
+  if (from !== undefined && from !== null) {
+    if (typeof from !== 'string' || !/^0x[a-fA-F0-9]{40}$/.test(from)) {
+      return res.status(400).json({ error: 'Invalid "from" address (optional, but must be a valid address when present).' });
+    }
+  }
+  if (gas !== undefined && gas !== null) {
+    const gasStr = String(gas);
+    if ((typeof gas !== 'string' && typeof gas !== 'number') || !/^(0x[a-fA-F0-9]+|\d+)$/.test(gasStr)) {
+      return res.status(400).json({ error: 'Invalid "gas" (optional, but must be a decimal or 0x-hex quantity when present).' });
+    }
+    req.body.gas = gasStr;
+  }
   next();
 };

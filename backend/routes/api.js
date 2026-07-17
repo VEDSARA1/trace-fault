@@ -48,8 +48,8 @@ router.get('/transactions/:address', validateAddress, async (req, res) => {
 
 router.post('/trace', validateTrace, async (req, res) => {
   try {
-    const { to, data, blockNumber } = req.body;
-    const result = await getTrace(to, data, blockNumber);
+    const { to, data, blockNumber, from, gas } = req.body;
+    const result = await getTrace(to, data, blockNumber, from, gas);
     res.json(result);
   } catch (error) {
     handleServiceError(error, res, 'trace');
