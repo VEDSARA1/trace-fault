@@ -138,10 +138,17 @@ function hexToUtf8(hex) {
   }
 }
 
+// Gas ratio at/above which an out-of-gas failure is near-certain. Shared as the
+// single source of truth between the pre-trace gate (skip the eth_call replay)
+// and the "Likely OOG" label, so the two can never disagree. The 0.95 "Possible
+// OOG" branch below is a separate, looser heuristic and intentionally NOT tied
+// to this constant.
+const OOG_CERTAIN_RATIO = 0.999;
+
 function classifySilentFailure(gasUsed, gasLimit) {
   if (!gasLimit) return "Bare revert() or custom error (no message)";
   const ratio = gasUsed / gasLimit;
-  if (ratio >= 0.99) return "Likely OOG (Out of Gas)";
+  if (ratio >= OOG_CERTAIN_RATIO) return "Likely OOG (Out of Gas)";
   if (ratio >= 0.95) return "Possible OOG";
   return "Bare revert() or custom error (no message)";
 }
@@ -260,42 +267,53 @@ export default function App() {
         const tx = failedTxs[i];
         setLoadingMsg(`Decoding transaction ${i + 1} of ${Math.min(failedTxs.length, 20)}...`);
 
-        let revertReason = null;
-        try {
-          const traceRes = await fetch(`${API_BASE}/api/trace`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              to: tx.to,
-              data: tx.input,
-              blockNumber: tx.blockNumber
-            }),
-            signal,
-          });
-          // Our backend surfaces failures as distinct HTTP statuses. One bad trace
-          // shouldn't kill the whole analysis — warn accurately and leave this tx as silent.
-          if (!traceRes.ok) {
-            if (traceRes.status === 429)
-              console.warn(`Trace rate-limited (429) on tx ${tx.hash}; leaving as silent.`);
-            else
-              console.warn(`Trace request failed (status ${traceRes.status}) on tx ${tx.hash}; leaving as silent.`);
-            revertReason = null;
-          } else {
-            const traceJson = await traceRes.json();
-            if (traceJson.result === null && traceJson.error?.message?.includes("rate")) {
-              console.warn(`Rate limited on tx ${tx.hash}`);
-              revertReason = null;
-            } else if (traceJson.error?.data) {
-              revertReason = decodeRevertReason(traceJson.error.data, selectorMap);
-            }
-          }
-        } catch (e) {
-          if (e.name === 'AbortError') throw e;
-          console.warn(`Trace error for tx ${tx.hash}:`, e.message);
-        }
-
         const gasUsed = parseInt(tx.gasUsed);
         const gasLimit = parseInt(tx.gas);
+
+        let revertReason = null;
+        // Cost gate: when gas usage alone makes an out-of-gas failure near-certain
+        // (>= OOG_CERTAIN_RATIO), skip the /api/trace eth_call replay — it costs an
+        // RPC round trip we already know won't yield a useful revert reason, and an
+        // eth_call replay of an OOG tx is unreliable anyway (it runs against the
+        // node's gas cap, not the tx's original limit). Heuristic tradeoff: a tx
+        // could deliberately revert this close to its limit and carry a real reason;
+        // gating here means that reason isn't fetched. Intentional for the common case.
+        const skipTrace = gasLimit > 0 && gasUsed / gasLimit >= OOG_CERTAIN_RATIO;
+        if (!skipTrace) {
+          try {
+            const traceRes = await fetch(`${API_BASE}/api/trace`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                to: tx.to,
+                data: tx.input,
+                blockNumber: tx.blockNumber
+              }),
+              signal,
+            });
+            // Our backend surfaces failures as distinct HTTP statuses. One bad trace
+            // shouldn't kill the whole analysis — warn accurately and leave this tx as silent.
+            if (!traceRes.ok) {
+              if (traceRes.status === 429)
+                console.warn(`Trace rate-limited (429) on tx ${tx.hash}; leaving as silent.`);
+              else
+                console.warn(`Trace request failed (status ${traceRes.status}) on tx ${tx.hash}; leaving as silent.`);
+              revertReason = null;
+            } else {
+              const traceJson = await traceRes.json();
+              if (traceJson.result === null && traceJson.error?.message?.includes("rate")) {
+                console.warn(`Rate limited on tx ${tx.hash}`);
+                revertReason = null;
+              } else if (traceJson.error?.data) {
+                revertReason = decodeRevertReason(traceJson.error.data, selectorMap);
+              }
+            }
+          } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            console.warn(`Trace error for tx ${tx.hash}:`, e.message);
+          }
+        }
+
         enriched.push({
           hash: tx.hash,
           blockNumber: tx.blockNumber,
