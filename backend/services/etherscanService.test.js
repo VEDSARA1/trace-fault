@@ -1,19 +1,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { getAbi, getTrace, EtherscanError, RateLimitError } from './etherscanService.js';
+import { getAbi, getTrace, getAddressType, RequestQueue, retryPolicy, EtherscanError, RateLimitError } from './etherscanService.js';
 
 const fetchMock = vi.fn();
 global.fetch = fetchMock;
 
+// Shared across every suite in this file: a clean mock and a configured API key.
+beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.ETHERSCAN_API_KEY = 'test-key';
+});
+
+afterEach(() => {
+    delete process.env.ETHERSCAN_API_KEY;
+});
+
+const TO = '0x1111111111111111111111111111111111111111';
+
 describe('etherscanService — ABI caching', () => {
-    beforeEach(() => {
-        vi.clearAllMocks();
-        process.env.ETHERSCAN_API_KEY = 'test-key';
-    });
-
-    afterEach(() => {
-        delete process.env.ETHERSCAN_API_KEY;
-    });
-
     // Regression test for a real bug: getAbi used to cache `null` any time the
     // fetch threw, including transient failures like a network blip — meaning a
     // single bad moment would permanently mark a perfectly good contract as
@@ -93,23 +96,13 @@ describe('etherscanService — ABI caching', () => {
 });
 
 describe('etherscanService — getTrace replay params', () => {
-    beforeEach(() => {
-        vi.clearAllMocks();
-        process.env.ETHERSCAN_API_KEY = 'test-key';
-    });
-
-    afterEach(() => {
-        delete process.env.ETHERSCAN_API_KEY;
-    });
-
-    const TO = '0x1111111111111111111111111111111111111111';
     const FROM = '0x9145da2c4a2d3dea910006a7861d29e219fd2d58';
     const ok = () => ({ ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: 1, result: '0x' }) });
     const calledUrl = () => fetchMock.mock.calls[0][0];
 
     it('builds the exact legacy URL when from/gas are not passed', async () => {
         fetchMock.mockResolvedValueOnce(ok());
-        await getTrace(TO, '0xabc123', '18500000');
+        await getTrace({ to: TO, data: '0xabc123', blockNumber: '18500000' });
         expect(calledUrl()).toBe(
             `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_call&to=${TO}&data=0xabc123&tag=0x11a49a0&apikey=test-key`
         );
@@ -117,7 +110,7 @@ describe('etherscanService — getTrace replay params', () => {
 
     it('appends &from= when a sender is passed', async () => {
         fetchMock.mockResolvedValueOnce(ok());
-        await getTrace(TO, '0xabc123', '18500000', FROM);
+        await getTrace({ to: TO, data: '0xabc123', blockNumber: '18500000', from: FROM });
         expect(calledUrl()).toBe(
             `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_call&to=${TO}&data=0xabc123&tag=0x11a49a0&from=${FROM}&apikey=test-key`
         );
@@ -125,29 +118,148 @@ describe('etherscanService — getTrace replay params', () => {
 
     it('hex-encodes decimal gas the same way blockNumber is encoded', async () => {
         fetchMock.mockResolvedValueOnce(ok());
-        await getTrace(TO, '0xabc123', '18500000', FROM, '100000');
+        await getTrace({ to: TO, data: '0xabc123', blockNumber: '18500000', from: FROM, gas: '100000' });
         expect(calledUrl()).toContain('&gas=0x186a0&');
     });
 
     it('passes 0x-hex gas through unchanged', async () => {
         fetchMock.mockResolvedValueOnce(ok());
-        await getTrace(TO, '0xabc123', '0x1', FROM, '0x186a0');
+        await getTrace({ to: TO, data: '0xabc123', blockNumber: '0x1', from: FROM, gas: '0x186a0' });
         expect(calledUrl()).toContain('&gas=0x186a0&');
     });
 });
 
+describe('etherscanService — rate-limit retry', () => {
+    const rateLimited = { ok: true, status: 200, json: async () => ({ status: '0', message: 'NOTOK', result: 'Max calls per sec rate limit reached (5/sec)' }) };
+    const ok = { ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: 1, result: '0x' }) };
+    const args = { to: '0x' + '1'.repeat(40), data: '0x', blockNumber: '0x1' };
+
+    afterEach(() => { retryPolicy.retries = 0; });
+
+    it('retries a throttled request and succeeds', async () => {
+        retryPolicy.retries = 3;
+        retryPolicy.baseDelayMs = 5;
+        fetchMock.mockResolvedValueOnce(rateLimited).mockResolvedValueOnce(ok);
+
+        await expect(getTrace(args)).resolves.toEqual({ jsonrpc: '2.0', id: 1, result: '0x' });
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('gives up after the configured number of retries', async () => {
+        retryPolicy.retries = 2;
+        retryPolicy.baseDelayMs = 5;
+        fetchMock.mockResolvedValue(rateLimited);
+
+        await expect(getTrace(args)).rejects.toThrow(RateLimitError);
+        expect(fetchMock).toHaveBeenCalledTimes(3); // initial + 2 retries
+    });
+
+    it('does not retry a non-rate-limit error', async () => {
+        retryPolicy.retries = 3;
+        fetchMock.mockResolvedValue({ ok: false, status: 500, json: async () => ({}) });
+
+        await expect(getTrace(args)).rejects.toThrow(EtherscanError);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('RequestQueue throttling', () => {
+    // Regression: the delay used to be applied only when another task was
+    // already waiting. Real callers are sequential (the frontend awaits each
+    // trace), so each arrived to an empty queue, took the no-delay path, and the
+    // throttle never engaged — we ran as fast as the network allowed and
+    // Etherscan replied 429. Spacing is now measured from when the previous
+    // request STARTED, so it holds for sequential callers too.
+    it('spaces sequential enqueues that each arrive to an empty queue', async () => {
+        const q = new RequestQueue(60);
+        const at = [];
+        const stamp = () => { at.push(Date.now()); return 'ok'; };
+
+        // Await each before enqueuing the next — the queue is empty every time.
+        await q.enqueue(stamp);
+        await q.enqueue(stamp);
+        await q.enqueue(stamp);
+
+        expect(at).toHaveLength(3);
+        expect(at[1] - at[0]).toBeGreaterThanOrEqual(50);
+        expect(at[2] - at[1]).toBeGreaterThanOrEqual(50);
+    });
+
+    it('still spaces a burst enqueued all at once', async () => {
+        const q = new RequestQueue(60);
+        const at = [];
+        const stamp = () => { at.push(Date.now()); return 'ok'; };
+
+        await Promise.all([q.enqueue(stamp), q.enqueue(stamp), q.enqueue(stamp)]);
+
+        expect(at[1] - at[0]).toBeGreaterThanOrEqual(50);
+        expect(at[2] - at[1]).toBeGreaterThanOrEqual(50);
+    });
+
+    // Regression: the wait is computed from a stored timestamp, so a clock that
+    // jumps backwards (NTP correction, or a suite faking timers) makes the
+    // elapsed time negative. Unclamped, delayMs - sinceLast then sleeps for the
+    // whole length of the jump and the queue never drains again.
+    it('never waits longer than one interval when the clock jumps backwards', async () => {
+        const q = new RequestQueue(60);
+        await q.enqueue(() => 'first');
+        q.lastRunAt = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30 days ahead
+
+        const start = Date.now();
+        await q.enqueue(() => 'second');
+        expect(Date.now() - start).toBeLessThan(500);
+    });
+
+    it('does not delay the very first request', async () => {
+        const q = new RequestQueue(500);
+        const start = Date.now();
+        await q.enqueue(() => 'ok');
+        expect(Date.now() - start).toBeLessThan(200);
+    });
+});
+
+describe('etherscanService — getAddressType', () => {
+    const rpc = (result) => ({ ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: 1, result }) });
+
+    it('classifies an address with no code as a wallet', async () => {
+        fetchMock.mockResolvedValueOnce(rpc('0x'));
+        expect(await getAddressType('0x' + 'b'.repeat(40))).toBe('wallet');
+    });
+
+    it('classifies an address with bytecode as a contract', async () => {
+        fetchMock.mockResolvedValueOnce(rpc('0x60806040523480156100'));
+        expect(await getAddressType('0x' + 'c'.repeat(40))).toBe('contract');
+    });
+
+    // Regression: since EIP-7702 (Pectra) an EOA can carry a delegation
+    // designator, so eth_getCode returns code for an account that is still a
+    // wallet. Observed live on vitalik.eth, which returned
+    // 0xef01005a7fc11397e9a8ad41bf10bf13f22b0a63f96f6d and was misread as a
+    // contract — flipping the analysis to inbound calls for a real wallet.
+    it('classifies an EIP-7702 delegated EOA as a wallet, not a contract', async () => {
+        fetchMock.mockResolvedValueOnce(rpc('0xef01005a7fc11397e9a8ad41bf10bf13f22b0a63f96f6d'));
+        expect(await getAddressType('0x' + 'f'.repeat(40))).toBe('wallet');
+    });
+
+    it('caches a contract result — no second fetch', async () => {
+        const addr = '0x' + 'd'.repeat(40);
+        fetchMock.mockResolvedValueOnce(rpc('0x6080604052'));
+        expect(await getAddressType(addr)).toBe('contract');
+        expect(await getAddressType(addr)).toBe('contract');
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not cache a thrown error — a later call retries', async () => {
+        const addr = '0x' + 'e'.repeat(40);
+        fetchMock.mockRejectedValueOnce(new TypeError('network down'));
+        await expect(getAddressType(addr)).rejects.toThrow(EtherscanError);
+        fetchMock.mockResolvedValueOnce(rpc('0x'));
+        expect(await getAddressType(addr)).toBe('wallet');
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+});
+
 describe('etherscanService — rate-limit detection', () => {
-    beforeEach(() => {
-        vi.clearAllMocks();
-        process.env.ETHERSCAN_API_KEY = 'test-key';
-    });
-
-    afterEach(() => {
-        delete process.env.ETHERSCAN_API_KEY;
-    });
-
-    const TO = '0x1111111111111111111111111111111111111111';
-
     // Regression test: an eth_call whose revert message happens to contain
     // "rate limit" is the CONTRACT's own error, not Etherscan throttling us.
     // It must NOT be misread as a RateLimitError (which the route maps to 429).
@@ -163,7 +275,7 @@ describe('etherscanService — rate-limit detection', () => {
         });
 
         // Resolves normally — the JSON-RPC error is returned to the caller, not thrown.
-        const result = await getTrace(TO, '0x', '0x1');
+        const result = await getTrace({ to: TO, data: '0x', blockNumber: '0x1' });
         expect(result.error.message).toContain('rate limit');
     });
 
@@ -180,6 +292,6 @@ describe('etherscanService — rate-limit detection', () => {
             }),
         });
 
-        await expect(getTrace(TO, '0x', '0x1')).rejects.toThrow(RateLimitError);
+        await expect(getTrace({ to: TO, data: '0x', blockNumber: '0x1' })).rejects.toThrow(RateLimitError);
     });
 });

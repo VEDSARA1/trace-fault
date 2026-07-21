@@ -25,10 +25,15 @@ app.use(cors({
 }));
 
 // Rate limiting to prevent abuse
+// Sized against real usage, not a round number: one analysis costs ~22 requests
+// (1 txlist + 1 address-type + up to 20 traces) plus up to 20 more if the user
+// expands every card. At the old limit of 200 a user hit this after ~8 analyses,
+// and our 429 is indistinguishable from Etherscan's to the client — so it
+// surfaced as "rate-limited" transactions rather than as a server-side cap.
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  limit: 200, // Limit each IP to 200 requests per windowMs
-  message: 'Too many requests from this IP, please try again later.',
+  limit: 600, // ~15 full analyses per window
+  message: { error: 'Too many requests from this IP, please try again later.' },
   standardHeaders: 'draft-7',
   legacyHeaders: false,
 });

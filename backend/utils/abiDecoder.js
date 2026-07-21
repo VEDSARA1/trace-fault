@@ -7,6 +7,7 @@
  * Public API:
  *   buildErrorSelectorMap(abi)          → Map<selector8hex, fragment>
  *   decodeCustomErrorArgs(fragment, argHex) → [{ name, type, value }, ...]
+ *   decodeRevertData(data, selectorMap) → { text, isCustomDecoded, errorName, args } | null
  */
 
 import { id as keccakId, AbiCoder, Fragment } from 'ethers';
@@ -81,6 +82,75 @@ export function decodeCustomErrorArgs(fragment, argHex) {
       type: inp.type,
       value: `0x${argHex.slice(i * 64, i * 64 + 64)}`,
     }));
+  }
+}
+
+// Remove C0/C7F control characters from a decoded revert string. Unlike the old
+// frontend decoder (which stripped everything outside printable ASCII) this
+// preserves legitimate non-ASCII text.
+// eslint-disable-next-line no-control-regex -- matching control chars IS the point
+const CONTROL_CHARS_RX = new RegExp('[\u0000-\u001F\u007F]', 'g');
+const stripControlChars = (s) => s.replace(CONTROL_CHARS_RX, '');
+
+// Solidity Panic(uint256) codes.
+const PANIC_MESSAGES = {
+  1: 'Assertion failed',
+  17: 'Arithmetic overflow/underflow',
+  18: 'Division by zero',
+  33: 'Enum value out of range',
+  34: 'Incorrectly encoded storage byte array',
+  49: 'Pop on empty array',
+  50: 'Array index out of bounds',
+  65: 'Memory allocation overflow',
+  81: 'Zero-initialized function pointer',
+};
+
+/**
+ * Decode raw revert data into a human-readable reason.
+ * Handles Error(string), Panic(uint256), and ABI-decoded custom errors.
+ * This is the single decoder for the app — the frontend renders what it returns.
+ *
+ * @param {string} data        - Raw hex revert data (with 0x prefix)
+ * @param {Map<string,object>} selectorMap - from buildErrorSelectorMap()
+ * @returns {{ text: string, isCustomDecoded: boolean, errorName: string|null, args: Array|null }|null}
+ */
+export function decodeRevertData(data, selectorMap = new Map()) {
+  if (!data || data === '0x') return null;
+  try {
+    const coder = AbiCoder.defaultAbiCoder();
+
+    if (data.startsWith('0x08c379a0')) {
+      const [text] = coder.decode(['string'], `0x${data.slice(10)}`);
+      // Strip control characters only — unlike the old frontend decoder this
+      // preserves legitimate non-ASCII text in revert strings.
+      return { text: stripControlChars(String(text)), isCustomDecoded: false, errorName: null, args: null };
+    }
+
+    if (data.startsWith('0x4e487b71')) {
+      const [code] = coder.decode(['uint256'], `0x${data.slice(10)}`);
+      const n = Number(code);
+      return { text: `Panic: ${PANIC_MESSAGES[n] || `Code ${n}`}`, isCustomDecoded: false, errorName: null, args: null };
+    }
+
+    if (data.length >= 10) {
+      const selector = data.slice(2, 10).toLowerCase();
+      const fragment = selectorMap?.get?.(selector);
+      if (fragment) {
+        const args = decodeCustomErrorArgs(fragment, data.slice(10));
+        const argsStr = args.map(a => `${a.name}: ${a.value}`).join(', ');
+        return {
+          text: argsStr ? `${fragment.name}(${argsStr})` : fragment.name,
+          isCustomDecoded: true,
+          errorName: fragment.name,
+          args,
+        };
+      }
+      // Unverified contract or an error not in the ABI — surface the raw selector.
+      return { text: `Custom error: 0x${selector}`, isCustomDecoded: false, errorName: null, args: null };
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 

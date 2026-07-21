@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { formatEth } from "./format.js";
 
 // Backend URL — set VITE_API_URL in your deployment environment.
 // Falls back to localhost for local development.
@@ -27,117 +28,6 @@ const PROTOCOL_REGISTRY = {
   "0x0000000071727de22e5e9d8baf0edac6f37da032": "ERC-4337 EntryPoint V0.7",
 };
 
-/**
- * Decode revert data into a human-readable reason string.
- * Handles Error(string), Panic(uint256), and ABI-decoded custom errors.
- *
- * @param {string} data - Raw hex revert data (may include 0x prefix)
- * @param {object} selectorMap - Map of { [4byteHex]: abiErrorFragment } from backend
- * @returns {{ text: string, isCustomDecoded: boolean, errorName: string|null, args: Array|null }|null}
- */
-function decodeRevertReason(data, selectorMap = {}) {
-  if (!data || data === "0x") return null;
-  try {
-    // --- Standard Error(string) ---
-    if (data.startsWith("0x08c379a0")) {
-      const hex = data.slice(10);
-      const offset = parseInt(hex.slice(0, 64), 16) * 2;
-      const length = parseInt(hex.slice(offset, offset + 64), 16) * 2;
-      const strHex = hex.slice(offset + 64, offset + 64 + length);
-      const text = hexToUtf8(strHex).replace(/[^\x20-\x7E]/g, "");
-      return { text, isCustomDecoded: false, errorName: null, args: null };
-    }
-    // --- Panic(uint256) ---
-    if (data.startsWith("0x4e487b71")) {
-      const code = parseInt(data.slice(10, 74), 16);
-      const panicMessages = {
-        1: "Assertion failed", 17: "Arithmetic overflow/underflow",
-        18: "Division by zero", 33: "Enum value out of range",
-        34: "Incorrectly encoded storage byte array", 49: "Pop on empty array",
-        50: "Array index out of bounds", 65: "Memory allocation overflow",
-        81: "Zero-initialized function pointer",
-      };
-      return { text: `Panic: ${panicMessages[code] || `Code ${code}`}`, isCustomDecoded: false, errorName: null, args: null };
-    }
-    // --- ABI-decoded custom error ---
-    if (data.length >= 10) {
-      const selector = data.slice(2, 10).toLowerCase(); // 4-byte hex, no 0x
-      const fragment = selectorMap[selector];
-      if (fragment) {
-        const argHex = data.slice(10); // bytes after selector
-        const decoded = decodeAbiArgs(fragment, argHex);
-        const argsStr = decoded.map(a => `${a.name}: ${a.value}`).join(", ");
-        const text = argsStr ? `${fragment.name}(${argsStr})` : fragment.name;
-        return { text, isCustomDecoded: true, errorName: fragment.name, args: decoded };
-      }
-      // Unknown selector — show raw
-      return { text: `Custom error: 0x${selector}`, isCustomDecoded: false, errorName: null, args: null };
-    }
-    return null;
-  } catch { return null; }
-}
-
-/**
- * Decode ABI argument bytes for a custom error fragment.
- * Uses a minimal inline decoder so the frontend stays self-contained.
- * Supports: uint<N>, int<N>, address, bool, bytes<N>, string, bytes.
- */
-function decodeAbiArgs(fragment, argHex) {
-  const inputs = (fragment.inputs || []);
-  if (inputs.length === 0 || !argHex) return [];
-
-  // Split into 32-byte (64 hex-char) words
-  const words = [];
-  for (let i = 0; i < argHex.length; i += 64) words.push(argHex.slice(i, i + 64).padEnd(64, '0'));
-
-  const results = [];
-  let headIdx = 0;
-  for (const inp of inputs) {
-    const word = words[headIdx] || '0'.repeat(64);
-    headIdx++;
-    const name = inp.name || `arg${headIdx - 1}`;
-    const type = inp.type;
-
-    try {
-      if (type === 'string' || type === 'bytes') {
-        const offset = parseInt(word, 16) * 2;
-        const len = parseInt(argHex.slice(offset, offset + 64), 16);
-        const raw = argHex.slice(offset + 64, offset + 64 + len * 2);
-        const value = type === 'string' ? hexToUtf8(raw) : `0x${raw}`;
-        results.push({ name, type, value });
-      } else if (type === 'address') {
-        results.push({ name, type, value: `0x${word.slice(24)}` });
-      } else if (type === 'bool') {
-        results.push({ name, type, value: word.slice(-1) === '1' ? 'true' : 'false' });
-      } else if (type.startsWith('uint')) {
-        results.push({ name, type, value: BigInt(`0x${word}`).toString() });
-      } else if (type.startsWith('int')) {
-        const bits = parseInt(type.replace('int', '') || '256');
-        const raw = BigInt(`0x${word}`);
-        const max = BigInt(1) << BigInt(bits - 1);
-        const value = raw >= max ? (raw - (BigInt(1) << BigInt(bits))).toString() : raw.toString();
-        results.push({ name, type, value });
-      } else if (/^bytes\d+$/.test(type)) {
-        const byteLen = parseInt(type.replace('bytes', ''));
-        results.push({ name, type, value: `0x${word.slice(0, byteLen * 2)}` });
-      } else {
-        results.push({ name, type, value: `0x${word}` });
-      }
-    } catch {
-      results.push({ name, type, value: `0x${word}` });
-    }
-  }
-  return results;
-}
-
-function hexToUtf8(hex) {
-  try {
-    return decodeURIComponent(hex.replace(/../g, '%$&'));
-  } catch {
-    return `0x${hex}`;
-  }
-}
-
 // Gas ratio at/above which an out-of-gas failure is near-certain. Shared as the
 // single source of truth between the pre-trace gate (skip the eth_call replay)
 // and the "Likely OOG" label, so the two can never disagree. The 0.95 "Possible
@@ -158,18 +48,6 @@ function lookupProtocol(address) {
   return PROTOCOL_REGISTRY[address.toLowerCase()] || null;
 }
 
-// Format a wei amount (decimal string) into a readable ETH string.
-function formatEth(wei) {
-  try {
-    const eth = Number(BigInt(wei)) / 1e18;
-    if (eth === 0) return "0";
-    if (eth < 0.00001) return eth.toExponential(2);
-    return eth.toLocaleString(undefined, { maximumFractionDigits: 6 });
-  } catch {
-    return "—";
-  }
-}
-
 function txTypeLabel(type) {
   if (type === 0) return "legacy (0)";
   if (type === 1) return "EIP-2930 (1)";
@@ -184,7 +62,9 @@ export default function App() {
   const [error, setError] = useState("");
   const [identified, setIdentified] = useState([]);
   const [silent, setSilent] = useState([]);
+  const [unknown, setUnknown] = useState([]);
   const [totalFailed, setTotalFailed] = useState(0);
+  const [addressType, setAddressType] = useState(null); // 'wallet' | 'contract'
   const [analyzed, setAnalyzed] = useState(false);
   const [traceActive, setTraceActive] = useState(false);
   const traceRef = useRef(null);
@@ -209,36 +89,22 @@ export default function App() {
     abortRef.current = controller;
     const { signal } = controller;
 
-    setError(""); setIdentified([]); setSilent([]); setTotalFailed(0); setAnalyzed(false);
+    setError(""); setIdentified([]); setSilent([]); setUnknown([]); setTotalFailed(0); setAnalyzed(false);
+    setAddressType(null);
     if (!contractAddress.trim() || !contractAddress.startsWith("0x") || contractAddress.length !== 42)
-      return setError("Enter a valid contract address (0x + 40 hex characters).");
+      return setError("Enter a valid address (0x + 40 hex characters).");
 
     setLoading(true); setTraceActive(true);
     setLoadingMsg("Fetching failed transactions from backend...");
 
     try {
-      setLoadingMsg("Fetching contract ABI...");
-      let selectorMap = {};
-      let contractVerified = false;
-      try {
-        const abiRes = await fetch(`${API_BASE}/api/abi/${contractAddress}`, { signal });
-        if (abiRes.ok) {
-          const abiJson = await abiRes.json();
-          selectorMap = abiJson.selectors || {};
-          contractVerified = abiJson.verified || false;
-        } else if (abiRes.status === 429) {
-          // Best-effort: skip ABI decoding this run rather than retrying into the rate limit.
-          console.warn('ABI fetch rate-limited (429); continuing without custom error decoding.');
-        } else {
-          console.warn(`ABI fetch failed (status ${abiRes.status}); continuing without custom error decoding.`);
-        }
-      } catch (abiErr) {
-        if (abiErr.name === 'AbortError') throw abiErr;
-        console.warn('ABI fetch failed, continuing without custom error decoding:', abiErr.message);
-      }
-
-      const url = `${API_BASE}/api/transactions/${contractAddress}`;
-      const res = await fetch(url, { signal });
+      // Address type and transactions are independent — fetch concurrently.
+      // No ABI prefetch: /api/trace resolves the ABI (cached server-side) and
+      // returns the already-decoded revert reason plus the verified flag.
+      const [res, typeRes] = await Promise.all([
+        fetch(`${API_BASE}/api/transactions/${contractAddress}`, { signal }),
+        fetch(`${API_BASE}/api/address-type/${contractAddress}`, { signal }),
+      ]);
 
       if (!res.ok) {
         if (res.status === 429)
@@ -248,27 +114,48 @@ export default function App() {
         return setError("The backend couldn't reach Etherscan. Please try again shortly.");
       }
 
+      // Type is best-effort: if it fails we fall back to 'contract', which keeps
+      // every transaction rather than wrongly filtering any out.
+      const type = typeRes.ok ? (await typeRes.json()).type : "contract";
+      const isWallet = type === "wallet";
+      setAddressType(type);
+
       const json = await res.json();
 
       if (json.status === "0") {
         if (json.message === "No transactions found")
-          return setError("No transactions found for this contract address.");
+          return setError("No transactions found for this address.");
         throw new Error(json.result || json.message);
       }
 
-      const allFailed = (json.result || []).filter(tx => tx.isError === "1");
+      let allFailed = (json.result || []).filter(tx => tx.isError === "1");
+      if (allFailed.length === 0)
+        return setError("No failed transactions found in the last 500 transactions.");
+
+      // Etherscan's txlist returns both directions. For a WALLET the meaningful
+      // failures are the ones it sent — inbound transfers that failed belong to
+      // someone else, and replaying a call to an EOA yields nothing anyway, so
+      // they'd only pad the results with unexplainable "silent" rows. For a
+      // CONTRACT the inbound calls are exactly what we want, so keep them all.
+      if (isWallet) {
+        const outbound = allFailed.filter(tx => tx.from?.toLowerCase() === contractAddress.toLowerCase());
+        if (outbound.length < allFailed.length)
+          console.info(`Skipped ${allFailed.length - outbound.length} inbound failure(s) — not sent by this wallet`);
+        allFailed = outbound;
+        if (allFailed.length === 0)
+          return setError("No failed transactions sent by this wallet in the last 500 transactions.");
+      }
+
       // Contract creations come back with an empty `to` (and a populated
       // contractAddress). They have no callee to replay via eth_call, and
       // semantically they're deployments BY this address, not failed calls TO
       // it — so they're excluded from analysis entirely.
-      const failedTxs = allFailed.filter(tx => tx.to && tx.to !== "");
-      const skippedCreations = allFailed.length - failedTxs.length;
-      if (skippedCreations > 0)
-        console.info(`Skipped ${skippedCreations} contract-creation tx(s) — not traceable`);
-      if (allFailed.length === 0)
-        return setError("No failed transactions found in the last 500 transactions.");
+      const failedTxs = allFailed.filter(tx => tx.to);
       if (failedTxs.length === 0)
         return setError("Only contract-creation failures found — nothing to trace.");
+      if (failedTxs.length < allFailed.length)
+        console.info(`Skipped ${allFailed.length - failedTxs.length} contract-creation tx(s) — not traceable`);
+
       // totalFailed deliberately counts analyzable failed CALLS (creations
       // excluded) so the summary matches what the analysis can actually show.
       setTotalFailed(failedTxs.length);
@@ -283,6 +170,11 @@ export default function App() {
         const gasLimit = parseInt(tx.gas);
 
         let revertReason = null;
+        let contractVerified = false;
+        // Set when we could NOT establish what happened. Distinct from a genuine
+        // bare revert: claiming "reverted with no message" for a tx we never
+        // successfully replayed asserts a fact about the chain we never learned.
+        let undetermined = null;
         // Cost gate: when gas usage alone makes an out-of-gas failure near-certain
         // (>= OOG_CERTAIN_RATIO), skip the /api/trace eth_call replay — it costs an
         // RPC round trip we already know won't yield a useful revert reason, and an
@@ -308,24 +200,29 @@ export default function App() {
               signal,
             });
             // Our backend surfaces failures as distinct HTTP statuses. One bad trace
-            // shouldn't kill the whole analysis — warn accurately and leave this tx as silent.
+            // shouldn't kill the whole analysis — record it as undetermined and move on.
             if (!traceRes.ok) {
-              if (traceRes.status === 429)
-                console.warn(`Trace rate-limited (429) on tx ${tx.hash}; leaving as silent.`);
-              else
-                console.warn(`Trace request failed (status ${traceRes.status}) on tx ${tx.hash}; leaving as silent.`);
-              revertReason = null;
+              undetermined = traceRes.status === 429
+                ? "Rate-limited — not analyzed"
+                : `Trace unavailable (HTTP ${traceRes.status})`;
+              console.warn(`Trace failed (status ${traceRes.status}) on tx ${tx.hash}; marking undetermined.`);
             } else {
+              // The backend decodes server-side and returns the reason ready to render.
               const traceJson = await traceRes.json();
-              if (traceJson.result === null && traceJson.error?.message?.includes("rate")) {
-                console.warn(`Rate limited on tx ${tx.hash}`);
-                revertReason = null;
-              } else if (traceJson.error?.data) {
-                revertReason = decodeRevertReason(traceJson.error.data, selectorMap);
+              contractVerified = traceJson.verified || false;
+              if (traceJson.outcome === "succeeded") {
+                // The replay ran without reverting, so it did not reproduce the
+                // on-chain failure — state at the replayed block differs from
+                // the state the transaction actually executed against.
+                undetermined = "Replay succeeded — failure not reproduced";
+              } else {
+                // Reverted. A null revert here is a genuine bare revert.
+                revertReason = traceJson.revert || null;
               }
             }
           } catch (e) {
             if (e.name === 'AbortError') throw e;
+            undetermined = "Trace request error";
             console.warn(`Trace error for tx ${tx.hash}:`, e.message);
           }
         }
@@ -342,14 +239,19 @@ export default function App() {
           gasPercent: gasLimit > 0 ? Math.round((gasUsed / gasLimit) * 100) : 0,
           revertReason: revertReason?.text || null,
           revertDecoded: revertReason?.isCustomDecoded ? revertReason : null,
-          silentType: !revertReason ? classifySilentFailure(gasUsed, gasLimit) : null,
+          undetermined,
+          // Only claim a silent failure when we actually observed one: either the
+          // replay reverted without data, or the OOG gate skipped it on strong
+          // gas evidence. Never for a trace we failed to complete.
+          silentType: !revertReason && !undetermined ? classifySilentFailure(gasUsed, gasLimit) : null,
           timeStamp: tx.timeStamp,
           contractVerified,
         });
       }
 
       setIdentified(enriched.filter(tx => tx.revertReason));
-      setSilent(enriched.filter(tx => !tx.revertReason));
+      setSilent(enriched.filter(tx => !tx.revertReason && !tx.undetermined));
+      setUnknown(enriched.filter(tx => !tx.revertReason && tx.undetermined));
       setAnalyzed(true);
     } catch (err) {
       if (err.name === 'AbortError') return;
@@ -382,6 +284,7 @@ export default function App() {
         .pill-revert { background: #1A1A2E; color: #A78BFA; border: 1px solid #3D3060; }
         .pill-custom { background: #0D2320; color: #4FFFB0; border: 1px solid #1A5040; }
         .pill-unverified { background: #1C1C1C; color: #64748B; border: 1px solid #2D3748; }
+        .pill-unknown { background: #171B24; color: #8892A4; border: 1px solid #2D3748; }
         input::placeholder { color: #4A5568; }
         input:focus { outline: none; border-color: #4FFFB0 !important; }
         @keyframes spin { to { transform: rotate(360deg); } }
@@ -409,8 +312,8 @@ export default function App() {
           <h1 style={{ fontSize: "26px", fontWeight: 600, color: "#F1F5F9", fontFamily: "'JetBrains Mono', monospace", letterSpacing: "-0.5px", marginBottom: "8px" }}>
             Failed Transaction Analyzer
           </h1>
-          <p style={{ fontSize: "14px", color: "#64748B", maxWidth: "520px", lineHeight: "1.6" }}>
-            Enter a contract address to fetch its failed transactions, decode revert reasons, and classify silent failures.
+          <p style={{ fontSize: "14px", color: "#64748B", maxWidth: "560px", lineHeight: "1.6" }}>
+            Enter a wallet or contract address to fetch its failed transactions, decode revert reasons, and classify silent failures.
           </p>
         </div>
 
@@ -420,11 +323,11 @@ export default function App() {
             value={contractAddress}
             onChange={e => setContractAddress(e.target.value)}
             onKeyDown={e => e.key === "Enter" && fetchAndAnalyze()}
-            placeholder="0x contract address (e.g. 1inch Router, Seaport...)"
+            placeholder="0x wallet or contract address"
             style={{ flex: 1, minWidth: "280px", background: "#0D1220", border: "1px solid #2D3748", color: "#E2E8F0", padding: "11px 16px", borderRadius: "8px", fontSize: "14px", fontFamily: "'JetBrains Mono', monospace" }}
           />
           <button className="btn-primary" onClick={fetchAndAnalyze} disabled={loading} style={{ background: loading ? "#2D3748" : "#4FFFB0", color: loading ? "#8892A4" : "#0A0E1A", border: "none", padding: "11px 24px", borderRadius: "8px", cursor: loading ? "not-allowed" : "pointer", fontSize: "14px", fontWeight: 600, whiteSpace: "nowrap", transition: "background 0.2s" }}>
-            {loading ? "Analyzing..." : "Analyze Contract →"}
+            {loading ? "Analyzing..." : "Analyze →"}
           </button>
         </div>
 
@@ -435,6 +338,7 @@ export default function App() {
             ["Seaport 1.6", "0x0000000000000068F116a894984e2DB1123eB395"],
             ["Uniswap V3", "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"],
             ["Aave V3", "0x87870Bca3F3fD6335C3F4CE8392D69350B4fA4E2"],
+            ["vitalik.eth (wallet)", "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"],
           ].map(([label, addr]) => (
             <button key={addr} onClick={() => setContractAddress(addr)} style={{ background: "transparent", border: "1px solid #2D3748", color: "#8892A4", padding: "4px 12px", borderRadius: "999px", cursor: "pointer", fontSize: "12px", fontFamily: "'JetBrains Mono', monospace" }}>
               {label}
@@ -460,12 +364,25 @@ export default function App() {
         {/* Results */}
         {analyzed && !loading && (
           <div>
+            {/* What was analyzed — the two address types mean different things. */}
+            {addressType && (
+              <div style={{ fontSize: "12px", color: "#4A5568", marginBottom: "12px", fontFamily: "'JetBrains Mono', monospace" }}>
+                <span className="pill pill-protocol" style={{ marginRight: "8px" }}>
+                  {addressType === "wallet" ? "WALLET" : "CONTRACT"}
+                </span>
+                {addressType === "wallet"
+                  ? "failed transactions sent by this wallet"
+                  : "failed calls made to this contract"}
+              </div>
+            )}
+
             {/* Summary */}
             <div style={{ display: "flex", gap: "16px", marginBottom: "28px", flexWrap: "wrap" }}>
               {[
-                { label: `Total Failed${totalFailed > identified.length + silent.length ? ` (${identified.length + silent.length} analyzed)` : ""}`, value: totalFailed, color: "#E2E8F0" },
+                { label: `${addressType === "wallet" ? "Failed Sent" : "Total Failed"}${totalFailed > identified.length + silent.length + unknown.length ? ` (${identified.length + silent.length + unknown.length} analyzed)` : ""}`, value: totalFailed, color: "#E2E8F0" },
                 { label: "Decoded Failures", value: identified.length, color: "#4FFFB0" },
                 { label: "Silent Failures", value: silent.length, color: "#FF6B6B" },
+                { label: "Undetermined", value: unknown.length, color: "#8892A4" },
               ].map(({ label, value, color }) => (
                 <div key={label} style={{ background: "#0D1220", border: "1px solid #1C2333", borderRadius: "8px", padding: "14px 20px", minWidth: "140px" }}>
                   <div style={{ fontSize: "24px", fontWeight: 600, color, fontFamily: "'JetBrains Mono', monospace" }}>{value}</div>
@@ -474,11 +391,12 @@ export default function App() {
               ))}
             </div>
 
-            {/* Two columns */}
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "24px" }}>
+            {/* Three buckets: decoded, genuinely silent, and not established. */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "24px" }}>
               {[
                 { bucket: identified, type: "decoded", label: "DECODED FAILURES", dot: "#4FFFB0", border: "#1A2E3A" },
                 { bucket: silent, type: "silent", label: "SILENT FAILURES", dot: "#FF6B6B", border: "#2D1515" },
+                { bucket: unknown, type: "undetermined", label: "UNDETERMINED", dot: "#8892A4", border: "#242C3A" },
               ].map(({ bucket, type, label, dot, border }) => (
                 <div key={type}>
                   <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "16px" }}>
@@ -487,7 +405,9 @@ export default function App() {
                     <span style={{ fontSize: "12px", color: "#4A5568" }}>({bucket.length})</span>
                   </div>
                   {bucket.length === 0
-                    ? <div style={{ color: "#4A5568", fontSize: "13px", padding: "20px 0" }}>No {type} failures found.</div>
+                    ? <div style={{ color: "#4A5568", fontSize: "13px", padding: "20px 0" }}>
+                        {type === "undetermined" ? "Every transaction was accounted for." : `No ${type} failures found.`}
+                      </div>
                     : <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
                         {bucket.map(tx => <TxCard key={tx.hash} tx={tx} border={border} shortHash={shortHash} formatTime={formatTime} />)}
                       </div>
@@ -502,7 +422,7 @@ export default function App() {
         {!analyzed && !loading && !error && (
           <div style={{ textAlign: "center", padding: "60px 20px", border: "1px dashed #1C2333", borderRadius: "12px" }}>
             <div style={{ fontSize: "32px", marginBottom: "12px", opacity: 0.4 }}>⬡</div>
-            <p style={{ color: "#4A5568", fontSize: "14px" }}>Enter a contract address to begin.</p>
+            <p style={{ color: "#4A5568", fontSize: "14px" }}>Enter a wallet or contract address to begin.</p>
             <p style={{ color: "#2D3748", fontSize: "12px", marginTop: "6px", fontFamily: "'JetBrains Mono', monospace" }}>Scans 500 transactions, analyzes up to 20 failed ones</p>
           </div>
         )}
@@ -574,7 +494,9 @@ function TxCard({ tx, border, shortHash, formatTime }) {
               {isCustomDecoded && <span style={{ marginRight: "4px", opacity: 0.7 }}>✦</span>}
               {tx.revertReason.slice(0, 72)}{tx.revertReason.length > 72 ? "..." : ""}
             </span>
-          : <span className={`pill ${isOOG ? "pill-oog" : "pill-silent"}`}>{tx.silentType}</span>
+          : tx.undetermined
+            ? <span className="pill pill-unknown" title="We could not establish why this transaction failed">? {tx.undetermined}</span>
+            : <span className={`pill ${isOOG ? "pill-oog" : "pill-silent"}`}>{tx.silentType}</span>
         }
       </div>
 

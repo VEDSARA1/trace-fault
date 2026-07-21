@@ -14,10 +14,11 @@ vi.mock('../services/etherscanService.js', async () => {
     getAbi: vi.fn(),
     getTransactionReceipt: vi.fn(),
     getTransactionByHash: vi.fn(),
+    getAddressType: vi.fn(),
   };
 });
 
-const { getTransactionReceipt, getTransactionByHash, RateLimitError } =
+const { getTransactionReceipt, getTransactionByHash, getAddressType, getTrace, getAbi, RateLimitError } =
   await import('../services/etherscanService.js');
 const apiRouter = (await import('./api.js')).default;
 
@@ -106,6 +107,78 @@ describe('GET /api/enrich/:hash', () => {
     getTransactionByHash.mockRejectedValue(new RateLimitError('slow down'));
 
     const res = await request(makeApp()).get(`/api/enrich/${HASH}`);
+    expect(res.status).toBe(429);
+  });
+});
+
+// A null `revert` is ambiguous by itself, so the route reports how the replay
+// ended. Without this the frontend cannot tell a genuine bare revert from a
+// replay that never reproduced the failure, and would wrongly claim the former.
+describe('POST /api/trace — replay outcome', () => {
+  const body = {
+    to: '0x' + 'a'.repeat(40),
+    data: '0x',
+    blockNumber: '18500000',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getAbi.mockResolvedValue(null);
+  });
+
+  it("reports outcome 'reverted' when the replay reverted with data", async () => {
+    getTrace.mockResolvedValue({ error: { code: 3, message: 'execution reverted', data: '0x5bf6f916' } });
+    const res = await request(makeApp()).post('/api/trace').send(body);
+    expect(res.status).toBe(200);
+    expect(res.body.outcome).toBe('reverted');
+    expect(res.body.revert).not.toBeNull();
+  });
+
+  it("reports outcome 'reverted' with a null revert for a genuine bare revert", async () => {
+    getTrace.mockResolvedValue({ error: { code: 3, message: 'execution reverted' } });
+    const res = await request(makeApp()).post('/api/trace').send(body);
+    expect(res.body.outcome).toBe('reverted');
+    expect(res.body.revert).toBeNull();
+  });
+
+  it("reports outcome 'succeeded' when the replay did not reproduce the failure", async () => {
+    getTrace.mockResolvedValue({ jsonrpc: '2.0', id: 1, result: '0x000000000000000000000000000000000000000000000000000000004a54fdf6' });
+    const res = await request(makeApp()).post('/api/trace').send(body);
+    expect(res.body.outcome).toBe('succeeded');
+    expect(res.body.revert).toBeNull();
+  });
+});
+
+describe('GET /api/address-type/:address', () => {
+  const ADDRESS = '0x' + 'a'.repeat(40);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('rejects an invalid address with 400', async () => {
+    const res = await request(makeApp()).get('/api/address-type/0xnothex');
+    expect(res.status).toBe(400);
+    expect(getAddressType).not.toHaveBeenCalled();
+  });
+
+  it('reports a wallet', async () => {
+    getAddressType.mockResolvedValue('wallet');
+    const res = await request(makeApp()).get(`/api/address-type/${ADDRESS}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ type: 'wallet' });
+  });
+
+  it('reports a contract', async () => {
+    getAddressType.mockResolvedValue('contract');
+    const res = await request(makeApp()).get(`/api/address-type/${ADDRESS}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ type: 'contract' });
+  });
+
+  it('maps a RateLimitError to 429', async () => {
+    getAddressType.mockRejectedValue(new RateLimitError('slow down'));
+    const res = await request(makeApp()).get(`/api/address-type/${ADDRESS}`);
     expect(res.status).toBe(429);
   });
 });

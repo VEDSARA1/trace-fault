@@ -108,7 +108,7 @@ describe('validateTrace', () => {
         validateTrace(req, res, next);
 
         expect(res.status).toHaveBeenCalledWith(400);
-        expect(res.json).toHaveBeenCalledWith({ error: 'Invalid "from" address (optional, but must be a valid address when present).' });
+        expect(res.json).toHaveBeenCalledWith({ error: 'Invalid "from" address.' });
         expect(next).not.toHaveBeenCalled();
     });
 
@@ -120,7 +120,7 @@ describe('validateTrace', () => {
         validateTrace(req, res, next);
 
         expect(res.status).toHaveBeenCalledWith(400);
-        expect(res.json).toHaveBeenCalledWith({ error: 'Invalid "gas" (optional, but must be a decimal or 0x-hex quantity when present).' });
+        expect(res.json).toHaveBeenCalledWith({ error: 'Invalid "gas" quantity.' });
         expect(next).not.toHaveBeenCalled();
     });
 });

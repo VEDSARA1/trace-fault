@@ -1,6 +1,17 @@
+const ADDRESS_RX = /^0x[a-fA-F0-9]{40}$/;
+const HASH_RX = /^0x[a-fA-F0-9]{64}$/;
+const QUANTITY_RX = /^(0x[a-fA-F0-9]+|\d+)$/;
+
+const isAddress = (v) => typeof v === 'string' && ADDRESS_RX.test(v);
+
+// A decimal-or-0x-hex quantity. Returns the value normalized to a string, or
+// null when invalid — callers normalize into req.body so downstream services
+// always receive a string (prevents TypeErrors on numeric input).
+const asQuantity = (v) =>
+  (typeof v === 'string' || typeof v === 'number') && QUANTITY_RX.test(String(v)) ? String(v) : null;
+
 export const validateAddress = (req, res, next) => {
-  const { address } = req.params;
-  if (typeof address !== 'string' || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
+  if (!isAddress(req.params.address)) {
     return res.status(400).json({ error: 'Invalid Ethereum contract address.' });
   }
   next();
@@ -8,38 +19,34 @@ export const validateAddress = (req, res, next) => {
 
 export const validateHash = (req, res, next) => {
   const { hash } = req.params;
-  if (typeof hash !== 'string' || !/^0x[a-fA-F0-9]{64}$/.test(hash)) {
+  if (typeof hash !== 'string' || !HASH_RX.test(hash)) {
     return res.status(400).json({ error: 'Invalid transaction hash.' });
   }
   next();
 };
 
 export const validateTrace = (req, res, next) => {
-  const { to, data, blockNumber } = req.body || {};
-  if (typeof to !== 'string' || !/^0x[a-fA-F0-9]{40}$/.test(to)) {
+  const { to, data, blockNumber, from, gas } = req.body || {};
+  if (!isAddress(to)) {
     return res.status(400).json({ error: 'Invalid "to" address.' });
   }
   if (typeof data !== 'string' || !/^0x[a-fA-F0-9]*$/.test(data)) {
     return res.status(400).json({ error: 'Invalid "data" hex string.' });
   }
-  const blockNumberStr = String(blockNumber);
-  if ((typeof blockNumber !== 'string' && typeof blockNumber !== 'number') || !/^(0x[a-fA-F0-9]+|\d+)$/.test(blockNumberStr)) {
+  const blockNumberStr = asQuantity(blockNumber);
+  if (blockNumberStr === null) {
     return res.status(400).json({ error: 'Invalid "blockNumber".' });
   }
-  // Normalize blockNumber to string to prevent TypeError in downstream services
   req.body.blockNumber = blockNumberStr;
 
   // Optional replay-fidelity fields: absent is fine; present-but-malformed is a 400.
-  const { from, gas } = req.body;
-  if (from !== undefined && from !== null) {
-    if (typeof from !== 'string' || !/^0x[a-fA-F0-9]{40}$/.test(from)) {
-      return res.status(400).json({ error: 'Invalid "from" address (optional, but must be a valid address when present).' });
-    }
+  if (from != null && !isAddress(from)) {
+    return res.status(400).json({ error: 'Invalid "from" address.' });
   }
-  if (gas !== undefined && gas !== null) {
-    const gasStr = String(gas);
-    if ((typeof gas !== 'string' && typeof gas !== 'number') || !/^(0x[a-fA-F0-9]+|\d+)$/.test(gasStr)) {
-      return res.status(400).json({ error: 'Invalid "gas" (optional, but must be a decimal or 0x-hex quantity when present).' });
+  if (gas != null) {
+    const gasStr = asQuantity(gas);
+    if (gasStr === null) {
+      return res.status(400).json({ error: 'Invalid "gas" quantity.' });
     }
     req.body.gas = gasStr;
   }

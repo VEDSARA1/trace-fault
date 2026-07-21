@@ -6,10 +6,11 @@ import {
   getAbi,
   getTransactionReceipt,
   getTransactionByHash,
+  getAddressType,
   ConfigError,
   RateLimitError,
 } from '../services/etherscanService.js';
-import { buildErrorSelectorMap } from '../utils/abiDecoder.js';
+import { buildErrorSelectorMap, decodeRevertData } from '../utils/abiDecoder.js';
 
 const router = express.Router();
 
@@ -46,11 +47,57 @@ router.get('/transactions/:address', validateAddress, async (req, res) => {
   }
 });
 
+/**
+ * GET /api/address-type/:address
+ * Classifies the address so the frontend knows which failures are meaningful:
+ * a wallet's own sent transactions, or the calls made to a contract.
+ * Response: { type: 'wallet' | 'contract' }
+ */
+router.get('/address-type/:address', validateAddress, async (req, res) => {
+  try {
+    res.json({ type: await getAddressType(req.params.address) });
+  } catch (error) {
+    handleServiceError(error, res, 'address-type');
+  }
+});
+
+/**
+ * POST /api/trace
+ * Replays the call and returns the DECODED revert reason. Decoding happens here
+ * (ethers) rather than in the browser so there is exactly one decoder — it
+ * handles ints, arrays and tuples correctly, which a hand-rolled one did not.
+ * Response: { revert: {…}|null, verified: bool, outcome: 'reverted'|'succeeded' }
+ *
+ * `outcome` matters: a null revert is ambiguous on its own. 'reverted' with a
+ * null revert means the call really did revert without decodable data (a
+ * genuine bare revert), whereas 'succeeded' means the replay did NOT reproduce
+ * the failure at all — we learned nothing, and the caller must not claim it
+ * reverted silently.
+ */
 router.post('/trace', validateTrace, async (req, res) => {
   try {
-    const { to, data, blockNumber, from, gas } = req.body;
-    const result = await getTrace(to, data, blockNumber, from, gas);
-    res.json(result);
+    // validateTrace has already checked/normalized the body; getTrace picks the
+    // fields it needs, so there's nothing to flatten and reassemble here.
+    const result = await getTrace(req.body);
+    const outcome = result?.error ? 'reverted' : 'succeeded';
+    const data = result?.error?.data;
+
+    let revert = null;
+    let verified = false;
+    try {
+      // getAbi is cached per address, so this costs one fetch per contract,
+      // not one per transaction.
+      const abi = await getAbi(req.body.to);
+      verified = Boolean(abi);
+      if (data) revert = decodeRevertData(data, buildErrorSelectorMap(abi || []));
+    } catch (abiErr) {
+      // An ABI failure must never sink the trace: Error(string) and Panic()
+      // decode without an ABI, and an unknown selector still yields raw output.
+      console.warn('[trace] ABI unavailable, decoding without it:', abiErr.message);
+      if (data) revert = decodeRevertData(data);
+    }
+
+    res.json({ revert, verified, outcome });
   } catch (error) {
     handleServiceError(error, res, 'trace');
   }

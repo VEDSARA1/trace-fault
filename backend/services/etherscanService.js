@@ -35,7 +35,15 @@ export class EtherscanError extends Error {
 const abiCache = new Map();
 const UNVERIFIED_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-class RequestQueue {
+// Address-type cache, same expiry reasoning as above: 'contract' is permanent
+// (deployed code never goes away for our purposes), while 'wallet' carries a TTL
+// because an empty address can later receive a deployment (notably via CREATE2).
+const addressTypeCache = new Map();
+const EIP7702_PREFIX = '0xef0100'; // delegation designator on an EOA
+
+// Exported for tests: the spacing logic is worth exercising in isolation,
+// without going through the shared module-level queue.
+export class RequestQueue {
   /**
    * @param {number} delayMs   Spacing enforced between successive requests.
    * @param {object} [opts]
@@ -48,6 +56,9 @@ class RequestQueue {
     this.maxWaitMs = maxWaitMs;
     this.queue = [];
     this.isProcessing = false;
+    // When the last request actually STARTED. Spacing is measured from this, not
+    // from queue occupancy — see processQueue.
+    this.lastRunAt = 0;
   }
 
   enqueue(task) {
@@ -79,15 +90,25 @@ class RequestQueue {
         continue;
       }
 
+      // Space from when the last request STARTED, not merely between items that
+      // happen to be queued together. Callers here are sequential (the frontend
+      // awaits each trace), so each arrives to an empty queue — gating the delay
+      // on queue occupancy meant the throttle never engaged at all and we ran as
+      // fast as the network allowed, straight past Etherscan's per-second limit.
+      // Clamped to delayMs: if the clock jumps backwards (NTP correction, or a
+      // test faking timers) sinceLast goes negative and an unclamped
+      // `delayMs - sinceLast` would sleep for the length of the jump, wedging
+      // the queue. Never wait longer than a single interval.
+      const sinceLast = Date.now() - this.lastRunAt;
+      const wait = Math.min(Math.max(this.delayMs - sinceLast, 0), this.delayMs);
+      if (wait > 0) await new Promise(r => setTimeout(r, wait));
+      this.lastRunAt = Date.now();
+
       try {
         const result = await task();
         resolve(result);
       } catch (error) {
         reject(error);
-      }
-
-      if (this.queue.length > 0) {
-        await new Promise(r => setTimeout(r, this.delayMs));
       }
     }
 
@@ -95,7 +116,10 @@ class RequestQueue {
   }
 }
 
-const etherscanQueue = new RequestQueue(250);
+// 250ms ≈ 4 req/sec, just under Etherscan's 5/sec free tier. Configurable so a
+// paid tier can go faster, and so tests can disable the wait entirely.
+const QUEUE_DELAY_MS = Number(process.env.ETHERSCAN_QUEUE_DELAY_MS ?? 250);
+const etherscanQueue = new RequestQueue(QUEUE_DELAY_MS);
 
 // Etherscan often returns HTTP 200 with a rate-limit message in the body
 // instead of a real 429, so we sniff the parsed JSON as well.
@@ -117,7 +141,30 @@ function looksLikeRateLimit(json) {
   return false;
 }
 
+// Bounded retry for rate limiting. Spacing alone can't prevent every 429 — the
+// budget is shared with other callers and each trace may spend two calls — so a
+// throttled request backs off and retries rather than being lost. Because queue
+// tasks run serially, sleeping here backs off the whole pipeline, which is what
+// we want. Mutable so tests can shorten or disable it.
+export const retryPolicy = {
+  retries: Number(process.env.ETHERSCAN_RATE_LIMIT_RETRIES ?? 3),
+  baseDelayMs: Number(process.env.ETHERSCAN_RETRY_BASE_MS ?? 300),
+};
+
 const fetchFromEtherscan = async (url) => {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetchOnce(url);
+    } catch (err) {
+      if (!(err instanceof RateLimitError) || attempt >= retryPolicy.retries) throw err;
+      const wait = retryPolicy.baseDelayMs * 2 ** attempt;
+      console.warn(`[etherscan] rate limited; backing off ${wait}ms (attempt ${attempt + 1}/${retryPolicy.retries})`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+};
+
+const fetchOnce = async (url) => {
   let response;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
@@ -184,7 +231,9 @@ function toHexQuantity(value, label) {
   return hex;
 }
 
-export const getTrace = async (to, data, blockNumber, from, gas) => {
+// Params arrive as an object: the set is expected to grow (see the `value` note
+// below), and positional optionals would force undefined placeholders as it does.
+export const getTrace = async ({ to, data, blockNumber, from, gas }) => {
   const apiKey = requireApiKey();
 
   const blockHex = toHexQuantity(blockNumber, 'blockNumber');
@@ -201,6 +250,55 @@ export const getTrace = async (to, data, blockNumber, from, gas) => {
 
   const traceUrl = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_call&to=${to}&data=${data}&tag=${blockHex}${extra}&apikey=${apiKey}`;
   return etherscanQueue.enqueue(() => fetchFromEtherscan(traceUrl));
+};
+
+/**
+ * Classify an address as 'wallet' (EOA, no code) or 'contract', via eth_getCode.
+ * The distinction drives analysis semantics: a wallet's failed transactions are
+ * the ones it SENT, whereas a contract's are the failed calls made TO it.
+ * Cached; errors are never cached so a transient failure retries.
+ *
+ * @returns {Promise<'wallet'|'contract'>}
+ */
+export const getAddressType = async (address) => {
+  const key = address.toLowerCase();
+  const cached = addressTypeCache.get(key);
+  if (cached) {
+    if (cached.promise) return await cached.promise;
+    if (cached.expiresAt === null || cached.expiresAt > Date.now()) return cached.value;
+    addressTypeCache.delete(key);
+  }
+
+  const fetchPromise = (async () => {
+    const apiKey = requireApiKey();
+    const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getCode&address=${address}&tag=latest&apikey=${apiKey}`;
+    const json = await etherscanQueue.enqueue(() => fetchFromEtherscan(url));
+    const code = typeof json?.result === 'string' ? json.result : '0x';
+
+    // Empty code — a plain externally owned account.
+    if (!code || code === '0x') return 'wallet';
+
+    // EIP-7702 delegation designator: 0xef0100 || <20-byte address>. Since
+    // Pectra an EOA can delegate to a contract, so eth_getCode returns code for
+    // an account that is still a wallet — it has a nonce and sends its own
+    // transactions. Treating it as a contract would flip the analysis semantics
+    // (inbound calls instead of sent transactions) for real, active wallets.
+    if (code.toLowerCase().startsWith(EIP7702_PREFIX)) return 'wallet';
+
+    return 'contract';
+  })();
+
+  addressTypeCache.set(key, { promise: fetchPromise });
+
+  try {
+    const value = await fetchPromise;
+    const expiresAt = value === 'contract' ? null : Date.now() + UNVERIFIED_TTL_MS;
+    addressTypeCache.set(key, { value, expiresAt });
+    return value;
+  } catch (err) {
+    addressTypeCache.delete(key);
+    throw err;
+  }
 };
 
 /**
