@@ -1,120 +1,57 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
-export class ConfigError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'ConfigError';
-  }
-}
+import { RequestQueue } from '../utils/requestQueue.js';
+import { ConfigError, RateLimitError, EtherscanError } from '../utils/errors.js';
 
-export class RateLimitError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'RateLimitError';
-  }
-}
+// Re-exported so callers keep importing the error vocabulary from the service
+// they use, rather than needing to know where it is defined.
+export { ConfigError, RateLimitError, EtherscanError };
 
-export class EtherscanError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'EtherscanError';
-  }
-}
-
-// ABI cache. key = address (lowercase) → one of:
+// Address-keyed caches. Each entry is one of:
 //   { promise }              an in-flight fetch (concurrent callers dedup on it)
-//   { value, expiresAt }     a resolved result
+//   { value, expiresAt }     a resolved result; expiresAt null = never expires
 //
-// value is a parsed ABI array (verified) or null (confirmed unverified).
-// expiresAt is null for verified ABIs — contract bytecode is immutable, so a
-// verified ABI never goes stale and is cached for the process lifetime. null
-// (unverified) entries carry a timestamp and expire after UNVERIFIED_TTL_MS, so
-// a contract that gets verified later is eventually picked up on re-fetch.
-// Transient errors are NEVER cached — they should be retried on the next call.
+// Both caches distinguish a permanent truth from a perishable one. A verified
+// ABI never goes stale (contract bytecode is immutable) and 'contract' is
+// likewise permanent, so those are kept for the process lifetime. The negative
+// answers are perishable — an unverified contract can be verified later, and an
+// empty address can receive a deployment (notably via CREATE2) — so they expire
+// after UNVERIFIED_TTL_MS and get re-fetched.
+// Transient errors are NEVER cached; they should be retried on the next call.
 const abiCache = new Map();
+const addressTypeCache = new Map();
 const UNVERIFIED_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-// Address-type cache, same expiry reasoning as above: 'contract' is permanent
-// (deployed code never goes away for our purposes), while 'wallet' carries a TTL
-// because an empty address can later receive a deployment (notably via CREATE2).
-const addressTypeCache = new Map();
-const EIP7702_PREFIX = '0xef0100'; // delegation designator on an EOA
+/**
+ * Run `fetcher` through an address-keyed cache: in-flight dedup, TTL expiry, and
+ * never caching a rejection. `isPermanent(value)` decides whether the resolved
+ * value is kept forever or expires after UNVERIFIED_TTL_MS.
+ */
+async function cachedFetch(cache, address, fetcher, isPermanent) {
+  const key = address.toLowerCase();
 
-// Exported for tests: the spacing logic is worth exercising in isolation,
-// without going through the shared module-level queue.
-export class RequestQueue {
-  /**
-   * @param {number} delayMs   Spacing enforced between successive requests.
-   * @param {object} [opts]
-   * @param {number} [opts.maxQueue]   Max tasks allowed to wait; beyond this, enqueue is rejected (backpressure).
-   * @param {number} [opts.maxWaitMs]  Max time a task may sit queued before it starts; exceeded → rejected.
-   */
-  constructor(delayMs, { maxQueue = 50, maxWaitMs = 15000 } = {}) {
-    this.delayMs = delayMs;
-    this.maxQueue = maxQueue;
-    this.maxWaitMs = maxWaitMs;
-    this.queue = [];
-    this.isProcessing = false;
-    // When the last request actually STARTED. Spacing is measured from this, not
-    // from queue occupancy — see processQueue.
-    this.lastRunAt = 0;
+  const cached = cache.get(key);
+  if (cached) {
+    if (cached.promise) return await cached.promise;
+    if (cached.expiresAt === null || cached.expiresAt > Date.now()) return cached.value;
+    cache.delete(key); // stale — drop it and re-fetch below
   }
 
-  enqueue(task) {
-    return new Promise((resolve, reject) => {
-      // Backpressure: don't let the queue grow without bound. A caller that
-      // arrives when we're already saturated fails fast with a rate-limit
-      // signal rather than waiting an unbounded amount of time.
-      if (this.queue.length >= this.maxQueue) {
-        reject(new RateLimitError('Server is busy (request queue full). Please retry shortly.'));
-        return;
-      }
-      this.queue.push({ task, resolve, reject, enqueuedAt: Date.now() });
-      this.processQueue();
-    });
-  }
+  const fetchPromise = fetcher();
+  cache.set(key, { promise: fetchPromise });
 
-  async processQueue() {
-    if (this.isProcessing || this.queue.length === 0) return;
-    this.isProcessing = true;
-
-    while (this.queue.length > 0) {
-      const { task, resolve, reject, enqueuedAt } = this.queue.shift();
-
-      // The per-request fetch timeout only starts once a task RUNS. A task that
-      // waited too long in line would otherwise hang the client far past that
-      // timeout, so drop it here instead of starting a now-stale request.
-      if (Date.now() - enqueuedAt > this.maxWaitMs) {
-        reject(new EtherscanError('Timed out waiting in the request queue.'));
-        continue;
-      }
-
-      // Space from when the last request STARTED, not merely between items that
-      // happen to be queued together. Callers here are sequential (the frontend
-      // awaits each trace), so each arrives to an empty queue — gating the delay
-      // on queue occupancy meant the throttle never engaged at all and we ran as
-      // fast as the network allowed, straight past Etherscan's per-second limit.
-      // Clamped to delayMs: if the clock jumps backwards (NTP correction, or a
-      // test faking timers) sinceLast goes negative and an unclamped
-      // `delayMs - sinceLast` would sleep for the length of the jump, wedging
-      // the queue. Never wait longer than a single interval.
-      const sinceLast = Date.now() - this.lastRunAt;
-      const wait = Math.min(Math.max(this.delayMs - sinceLast, 0), this.delayMs);
-      if (wait > 0) await new Promise(r => setTimeout(r, wait));
-      this.lastRunAt = Date.now();
-
-      try {
-        const result = await task();
-        resolve(result);
-      } catch (error) {
-        reject(error);
-      }
-    }
-
-    this.isProcessing = false;
+  try {
+    const value = await fetchPromise;
+    cache.set(key, { value, expiresAt: isPermanent(value) ? null : Date.now() + UNVERIFIED_TTL_MS });
+    return value;
+  } catch (err) {
+    cache.delete(key);
+    throw err;
   }
 }
+const EIP7702_PREFIX = '0xef0100'; // delegation designator on an EOA
+
 
 // 250ms ≈ 4 req/sec, just under Etherscan's 5/sec free tier. Configurable so a
 // paid tier can go faster, and so tests can disable the wait entirely.
@@ -260,46 +197,27 @@ export const getTrace = async ({ to, data, blockNumber, from, gas }) => {
  *
  * @returns {Promise<'wallet'|'contract'>}
  */
-export const getAddressType = async (address) => {
-  const key = address.toLowerCase();
-  const cached = addressTypeCache.get(key);
-  if (cached) {
-    if (cached.promise) return await cached.promise;
-    if (cached.expiresAt === null || cached.expiresAt > Date.now()) return cached.value;
-    addressTypeCache.delete(key);
-  }
+export const getAddressType = (address) =>
+  cachedFetch(addressTypeCache, address, () => fetchAddressType(address), v => v === 'contract');
 
-  const fetchPromise = (async () => {
-    const apiKey = requireApiKey();
-    const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getCode&address=${address}&tag=latest&apikey=${apiKey}`;
-    const json = await etherscanQueue.enqueue(() => fetchFromEtherscan(url));
-    const code = typeof json?.result === 'string' ? json.result : '0x';
+async function fetchAddressType(address) {
+  const apiKey = requireApiKey();
+  const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getCode&address=${address}&tag=latest&apikey=${apiKey}`;
+  const json = await etherscanQueue.enqueue(() => fetchFromEtherscan(url));
+  const code = typeof json?.result === 'string' ? json.result : '0x';
 
-    // Empty code — a plain externally owned account.
-    if (!code || code === '0x') return 'wallet';
+  // Empty code — a plain externally owned account.
+  if (!code || code === '0x') return 'wallet';
 
-    // EIP-7702 delegation designator: 0xef0100 || <20-byte address>. Since
-    // Pectra an EOA can delegate to a contract, so eth_getCode returns code for
-    // an account that is still a wallet — it has a nonce and sends its own
-    // transactions. Treating it as a contract would flip the analysis semantics
-    // (inbound calls instead of sent transactions) for real, active wallets.
-    if (code.toLowerCase().startsWith(EIP7702_PREFIX)) return 'wallet';
+  // EIP-7702 delegation designator: 0xef0100 || <20-byte address>. Since
+  // Pectra an EOA can delegate to a contract, so eth_getCode returns code for
+  // an account that is still a wallet — it has a nonce and sends its own
+  // transactions. Treating it as a contract would flip the analysis semantics
+  // (inbound calls instead of sent transactions) for real, active wallets.
+  if (code.toLowerCase().startsWith(EIP7702_PREFIX)) return 'wallet';
 
-    return 'contract';
-  })();
-
-  addressTypeCache.set(key, { promise: fetchPromise });
-
-  try {
-    const value = await fetchPromise;
-    const expiresAt = value === 'contract' ? null : Date.now() + UNVERIFIED_TTL_MS;
-    addressTypeCache.set(key, { value, expiresAt });
-    return value;
-  } catch (err) {
-    addressTypeCache.delete(key);
-    throw err;
-  }
-};
+  return 'contract';
+}
 
 /**
  * Fetch a transaction receipt (eth_getTransactionReceipt).
@@ -326,49 +244,22 @@ export const getTransactionByHash = async (hash) => {
  * Returns a parsed ABI array, or null if the contract is confirmed unverified.
  * Throws ConfigError / RateLimitError / EtherscanError on failure — nothing is cached in that case.
  */
-export const getAbi = async (address) => {
-  const key = address.toLowerCase();
+export const getAbi = (address) =>
+  cachedFetch(abiCache, address, () => fetchAbi(address), v => v !== null);
 
-  const cached = abiCache.get(key);
-  if (cached) {
-    // In-flight fetch: dedup by awaiting the same promise.
-    if (cached.promise) return await cached.promise;
-    // Resolved: verified entries never expire (expiresAt null); unverified
-    // entries are honored until their TTL lapses.
-    if (cached.expiresAt === null || cached.expiresAt > Date.now()) {
-      return cached.value;
-    }
-    // Stale unverified entry — drop it and re-fetch below.
-    abiCache.delete(key);
+async function fetchAbi(address) {
+  const apiKey = requireApiKey();
+  const url = `https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getabi&address=${address}&apikey=${apiKey}`;
+
+  const json = await etherscanQueue.enqueue(() => fetchFromEtherscan(url));
+
+  if (json.status !== '1' || !json.result || json.result === 'Contract source code not verified') {
+    return null;
   }
-
-  const fetchPromise = (async () => {
-    const apiKey = requireApiKey();
-    const url = `https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getabi&address=${address}&apikey=${apiKey}`;
-
-    const json = await etherscanQueue.enqueue(() => fetchFromEtherscan(url));
-
-    if (json.status !== '1' || !json.result || json.result === 'Contract source code not verified') {
-      return null;
-    }
-
-    try {
-      return JSON.parse(json.result);
-    } catch (err) {
-      throw new EtherscanError(`Etherscan returned malformed ABI JSON: ${err.message}`);
-    }
-  })();
-
-  abiCache.set(key, { promise: fetchPromise });
 
   try {
-    const result = await fetchPromise;
-    // Verified (array) → cache forever; unverified (null) → 24h TTL.
-    const expiresAt = result === null ? Date.now() + UNVERIFIED_TTL_MS : null;
-    abiCache.set(key, { value: result, expiresAt });
-    return result;
+    return JSON.parse(json.result);
   } catch (err) {
-    abiCache.delete(key);
-    throw err;
+    throw new EtherscanError(`Etherscan returned malformed ABI JSON: ${err.message}`);
   }
-};
+}

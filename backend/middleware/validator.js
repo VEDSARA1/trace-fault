@@ -3,6 +3,7 @@ const HASH_RX = /^0x[a-fA-F0-9]{64}$/;
 const QUANTITY_RX = /^(0x[a-fA-F0-9]+|\d+)$/;
 
 const isAddress = (v) => typeof v === 'string' && ADDRESS_RX.test(v);
+const isHash = (v) => typeof v === 'string' && HASH_RX.test(v);
 
 // A decimal-or-0x-hex quantity. Returns the value normalized to a string, or
 // null when invalid — callers normalize into req.body so downstream services
@@ -18,8 +19,7 @@ export const validateAddress = (req, res, next) => {
 };
 
 export const validateHash = (req, res, next) => {
-  const { hash } = req.params;
-  if (typeof hash !== 'string' || !HASH_RX.test(hash)) {
+  if (!isHash(req.params.hash)) {
     return res.status(400).json({ error: 'Invalid transaction hash.' });
   }
   next();

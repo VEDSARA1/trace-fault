@@ -2,17 +2,16 @@ const WEI_PER_ETH = 1000000000000000000n; // 1e18
 const EXPONENTIAL_BELOW_WEI = 10000000000000n; // 1e13 wei = 0.00001 ETH
 
 /**
- * Exponential form for sub-0.00001 ETH amounts, mirroring Number#toExponential(2)
- * but computed from the wei DIGITS so the value never passes through Number.
- * Only 3-digit mantissa arithmetic touches Number, which is always exact.
+ * Exponential form for sub-0.00001 ETH amounts, matching Number#toExponential(2).
+ * Derived from the wei digits rather than a float: a naive
+ * `(Number(abs) / 1e18).toExponential(2)` disagrees on exact ties (1005 wei
+ * gives 1.00e-15 instead of 1.01e-15), because the division is inexact.
+ * The digit string has no leading zeros, so its length gives the exponent.
  */
 function weiToExponential(abs) {
-  const frac = abs.toString().padStart(18, "0"); // safe: caller guarantees abs < 1e13
-  const firstSig = frac.search(/[1-9]/);
-  let exponent = -(firstSig + 1);
-  const digits = (frac.slice(firstSig) + "0000").slice(0, 4);
-  let mantissa = Number(digits.slice(0, 3)); // 100..999
-  if (Number(digits[3]) >= 5) mantissa += 1; // round like toExponential(2)
+  const s = abs.toString();
+  let exponent = s.length - 19; // 1 wei -> -18
+  let mantissa = Math.round(Number((s + "000").slice(0, 4)) / 10); // 4 sig digits -> 3, half-up
   if (mantissa === 1000) { mantissa = 100; exponent += 1; } // 9.99e-7 -> 1.00e-6
   const m = String(mantissa);
   return `${m[0]}.${m.slice(1)}e${exponent}`;

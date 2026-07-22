@@ -74,6 +74,19 @@ router.get('/address-type/:address', validateAddress, async (req, res) => {
  * the failure at all — we learned nothing, and the caller must not claim it
  * reverted silently.
  */
+// Resolve a contract's error selectors, degrading to an empty map. An ABI
+// failure must never sink the trace: Error(string) and Panic() decode without
+// one, and an unknown selector still yields raw output.
+async function resolveErrorSelectors(address) {
+  try {
+    const abi = await getAbi(address);
+    return { verified: Boolean(abi), selectors: buildErrorSelectorMap(abi || []) };
+  } catch (err) {
+    console.warn('[trace] ABI unavailable, decoding without it:', err.message);
+    return { verified: false, selectors: new Map() };
+  }
+}
+
 router.post('/trace', validateTrace, async (req, res) => {
   try {
     // validateTrace has already checked/normalized the body; getTrace picks the
@@ -82,47 +95,17 @@ router.post('/trace', validateTrace, async (req, res) => {
     const outcome = result?.error ? 'reverted' : 'succeeded';
     const data = result?.error?.data;
 
-    let revert = null;
-    let verified = false;
-    try {
-      // getAbi is cached per address, so this costs one fetch per contract,
-      // not one per transaction.
-      const abi = await getAbi(req.body.to);
-      verified = Boolean(abi);
-      if (data) revert = decodeRevertData(data, buildErrorSelectorMap(abi || []));
-    } catch (abiErr) {
-      // An ABI failure must never sink the trace: Error(string) and Panic()
-      // decode without an ABI, and an unknown selector still yields raw output.
-      console.warn('[trace] ABI unavailable, decoding without it:', abiErr.message);
-      if (data) revert = decodeRevertData(data);
-    }
+    // Only fetch the ABI when there is revert data for it to decode. With no
+    // data the selector map is unused and `verified` is never rendered, so the
+    // fetch would be a wasted queue slot — and on the wallet path every
+    // transaction has a different callee, so those misses are not amortized.
+    const { verified, selectors } = data
+      ? await resolveErrorSelectors(req.body.to)
+      : { verified: false, selectors: new Map() };
 
-    res.json({ revert, verified, outcome });
+    res.json({ revert: data ? decodeRevertData(data, selectors) : null, verified, outcome });
   } catch (error) {
     handleServiceError(error, res, 'trace');
-  }
-});
-
-/**
- * GET /api/abi/:address
- * Returns the verified error selector map for the contract, plus a verified flag.
- * If the contract is confirmed unverified, returns an empty map and verified: false.
- * Real failures (config / rate-limit / upstream) return the appropriate error status.
- */
-router.get('/abi/:address', validateAddress, async (req, res) => {
-  try {
-    const abi = await getAbi(req.params.address);
-    if (!abi) {
-      return res.json({ verified: false, selectors: {} });
-    }
-    const selectorMap = buildErrorSelectorMap(abi);
-    const selectors = {};
-    for (const [sel, frag] of selectorMap.entries()) {
-      selectors[sel] = frag;
-    }
-    res.json({ verified: true, selectors });
-  } catch (error) {
-    handleServiceError(error, res, 'abi');
   }
 });
 

@@ -35,6 +35,12 @@ const PROTOCOL_REGISTRY = {
 // to this constant.
 const OOG_CERTAIN_RATIO = 0.999;
 
+// A transaction's analysis outcome. DECODED: we recovered a revert reason.
+// SILENT: the replay reverted with nothing to decode (or the OOG gate skipped it
+// on strong gas evidence). UNDETERMINED: we never established anything — the
+// trace failed or the replay didn't reproduce the failure.
+const STATUS = { DECODED: "decoded", SILENT: "silent", UNDETERMINED: "undetermined" };
+
 function classifySilentFailure(gasUsed, gasLimit) {
   if (!gasLimit) return "Bare revert() or custom error (no message)";
   const ratio = gasUsed / gasLimit;
@@ -60,9 +66,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState("");
   const [error, setError] = useState("");
-  const [identified, setIdentified] = useState([]);
-  const [silent, setSilent] = useState([]);
-  const [unknown, setUnknown] = useState([]);
+  const [results, setResults] = useState([]);
   const [totalFailed, setTotalFailed] = useState(0);
   const [addressType, setAddressType] = useState(null); // 'wallet' | 'contract'
   const [analyzed, setAnalyzed] = useState(false);
@@ -89,7 +93,7 @@ export default function App() {
     abortRef.current = controller;
     const { signal } = controller;
 
-    setError(""); setIdentified([]); setSilent([]); setUnknown([]); setTotalFailed(0); setAnalyzed(false);
+    setError(""); setResults([]); setTotalFailed(0); setAnalyzed(false);
     setAddressType(null);
     if (!contractAddress.trim() || !contractAddress.startsWith("0x") || contractAddress.length !== 42)
       return setError("Enter a valid address (0x + 40 hex characters).");
@@ -227,6 +231,11 @@ export default function App() {
           }
         }
 
+        // One explicit outcome per transaction, decided once here. Everything
+        // downstream (bucketing, the summary counts, the pill) keys off it
+        // rather than re-deriving the same rule from two nullable fields.
+        const status = revertReason ? STATUS.DECODED : undetermined ? STATUS.UNDETERMINED : STATUS.SILENT;
+
         enriched.push({
           hash: tx.hash,
           blockNumber: tx.blockNumber,
@@ -237,21 +246,20 @@ export default function App() {
           gasUsed,
           gasLimit,
           gasPercent: gasLimit > 0 ? Math.round((gasUsed / gasLimit) * 100) : 0,
+          status,
           revertReason: revertReason?.text || null,
           revertDecoded: revertReason?.isCustomDecoded ? revertReason : null,
           undetermined,
           // Only claim a silent failure when we actually observed one: either the
           // replay reverted without data, or the OOG gate skipped it on strong
           // gas evidence. Never for a trace we failed to complete.
-          silentType: !revertReason && !undetermined ? classifySilentFailure(gasUsed, gasLimit) : null,
+          silentType: status === STATUS.SILENT ? classifySilentFailure(gasUsed, gasLimit) : null,
           timeStamp: tx.timeStamp,
           contractVerified,
         });
       }
 
-      setIdentified(enriched.filter(tx => tx.revertReason));
-      setSilent(enriched.filter(tx => !tx.revertReason && !tx.undetermined));
-      setUnknown(enriched.filter(tx => !tx.revertReason && tx.undetermined));
+      setResults(enriched);
       setAnalyzed(true);
     } catch (err) {
       if (err.name === 'AbortError') return;
@@ -264,6 +272,7 @@ export default function App() {
     }
   }
 
+  const countByStatus = status => results.reduce((n, tx) => n + (tx.status === status ? 1 : 0), 0);
   const shortHash = h => `${h.slice(0, 8)}...${h.slice(-6)}`;
   const formatTime = ts => new Date(parseInt(ts) * 1000).toLocaleString();
 
@@ -284,7 +293,7 @@ export default function App() {
         .pill-revert { background: #1A1A2E; color: #A78BFA; border: 1px solid #3D3060; }
         .pill-custom { background: #0D2320; color: #4FFFB0; border: 1px solid #1A5040; }
         .pill-unverified { background: #1C1C1C; color: #64748B; border: 1px solid #2D3748; }
-        .pill-unknown { background: #171B24; color: #8892A4; border: 1px solid #2D3748; }
+        .pill-undetermined { background: #171B24; color: #8892A4; border: 1px solid #2D3748; }
         input::placeholder { color: #4A5568; }
         input:focus { outline: none; border-color: #4FFFB0 !important; }
         @keyframes spin { to { transform: rotate(360deg); } }
@@ -379,10 +388,10 @@ export default function App() {
             {/* Summary */}
             <div style={{ display: "flex", gap: "16px", marginBottom: "28px", flexWrap: "wrap" }}>
               {[
-                { label: `${addressType === "wallet" ? "Failed Sent" : "Total Failed"}${totalFailed > identified.length + silent.length + unknown.length ? ` (${identified.length + silent.length + unknown.length} analyzed)` : ""}`, value: totalFailed, color: "#E2E8F0" },
-                { label: "Decoded Failures", value: identified.length, color: "#4FFFB0" },
-                { label: "Silent Failures", value: silent.length, color: "#FF6B6B" },
-                { label: "Undetermined", value: unknown.length, color: "#8892A4" },
+                { label: `${addressType === "wallet" ? "Failed Sent" : "Total Failed"}${totalFailed > results.length ? ` (${results.length} analyzed)` : ""}`, value: totalFailed, color: "#E2E8F0" },
+                { label: "Decoded Failures", value: countByStatus(STATUS.DECODED), color: "#4FFFB0" },
+                { label: "Silent Failures", value: countByStatus(STATUS.SILENT), color: "#FF6B6B" },
+                { label: "Undetermined", value: countByStatus(STATUS.UNDETERMINED), color: "#8892A4" },
               ].map(({ label, value, color }) => (
                 <div key={label} style={{ background: "#0D1220", border: "1px solid #1C2333", borderRadius: "8px", padding: "14px 20px", minWidth: "140px" }}>
                   <div style={{ fontSize: "24px", fontWeight: 600, color, fontFamily: "'JetBrains Mono', monospace" }}>{value}</div>
@@ -394,10 +403,12 @@ export default function App() {
             {/* Three buckets: decoded, genuinely silent, and not established. */}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "24px" }}>
               {[
-                { bucket: identified, type: "decoded", label: "DECODED FAILURES", dot: "#4FFFB0", border: "#1A2E3A" },
-                { bucket: silent, type: "silent", label: "SILENT FAILURES", dot: "#FF6B6B", border: "#2D1515" },
-                { bucket: unknown, type: "undetermined", label: "UNDETERMINED", dot: "#8892A4", border: "#242C3A" },
-              ].map(({ bucket, type, label, dot, border }) => (
+                { type: STATUS.DECODED, label: "DECODED FAILURES", dot: "#4FFFB0", border: "#1A2E3A" },
+                { type: STATUS.SILENT, label: "SILENT FAILURES", dot: "#FF6B6B", border: "#2D1515" },
+                { type: STATUS.UNDETERMINED, label: "UNDETERMINED", dot: "#8892A4", border: "#242C3A" },
+              ].map(({ type, label, dot, border }) => {
+                const bucket = results.filter(tx => tx.status === type);
+                return (
                 <div key={type}>
                   <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "16px" }}>
                     <div style={{ width: "8px", height: "8px", borderRadius: "50%", background: dot }} />
@@ -406,14 +417,15 @@ export default function App() {
                   </div>
                   {bucket.length === 0
                     ? <div style={{ color: "#4A5568", fontSize: "13px", padding: "20px 0" }}>
-                        {type === "undetermined" ? "Every transaction was accounted for." : `No ${type} failures found.`}
+                        {type === STATUS.UNDETERMINED ? "Every transaction was accounted for." : `No ${type} failures found.`}
                       </div>
                     : <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
                         {bucket.map(tx => <TxCard key={tx.hash} tx={tx} border={border} shortHash={shortHash} formatTime={formatTime} />)}
                       </div>
                   }
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
@@ -487,17 +499,20 @@ function TxCard({ tx, border, shortHash, formatTime }) {
       {/* Protocol */}
       {tx.protocol && <div style={{ marginBottom: "8px" }}><span className="pill pill-protocol">{tx.protocol}</span></div>}
 
-      {/* Revert / silent pill */}
+      {/* Outcome pill — one branch per status. */}
       <div style={{ marginBottom: "8px" }}>
-        {tx.revertReason
-          ? <span className={`pill ${isCustomDecoded ? "pill-custom" : "pill-revert"}`}>
-              {isCustomDecoded && <span style={{ marginRight: "4px", opacity: 0.7 }}>✦</span>}
-              {tx.revertReason.slice(0, 72)}{tx.revertReason.length > 72 ? "..." : ""}
-            </span>
-          : tx.undetermined
-            ? <span className="pill pill-unknown" title="We could not establish why this transaction failed">? {tx.undetermined}</span>
-            : <span className={`pill ${isOOG ? "pill-oog" : "pill-silent"}`}>{tx.silentType}</span>
-        }
+        {tx.status === STATUS.DECODED && (
+          <span className={`pill ${isCustomDecoded ? "pill-custom" : "pill-revert"}`}>
+            {isCustomDecoded && <span style={{ marginRight: "4px", opacity: 0.7 }}>✦</span>}
+            {tx.revertReason.slice(0, 72)}{tx.revertReason.length > 72 ? "..." : ""}
+          </span>
+        )}
+        {tx.status === STATUS.UNDETERMINED && (
+          <span className="pill pill-undetermined" title="We could not establish why this transaction failed">? {tx.undetermined}</span>
+        )}
+        {tx.status === STATUS.SILENT && (
+          <span className={`pill ${isOOG ? "pill-oog" : "pill-silent"}`}>{tx.silentType}</span>
+        )}
       </div>
 
       {/* Gas bar */}

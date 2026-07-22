@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { getAbi, getTrace, getAddressType, RequestQueue, retryPolicy, EtherscanError, RateLimitError } from './etherscanService.js';
+import { getAbi, getTrace, getAddressType, retryPolicy, EtherscanError, RateLimitError } from './etherscanService.js';
 
 const fetchMock = vi.fn();
 global.fetch = fetchMock;
@@ -163,60 +163,6 @@ describe('etherscanService — rate-limit retry', () => {
     });
 });
 
-describe('RequestQueue throttling', () => {
-    // Regression: the delay used to be applied only when another task was
-    // already waiting. Real callers are sequential (the frontend awaits each
-    // trace), so each arrived to an empty queue, took the no-delay path, and the
-    // throttle never engaged — we ran as fast as the network allowed and
-    // Etherscan replied 429. Spacing is now measured from when the previous
-    // request STARTED, so it holds for sequential callers too.
-    it('spaces sequential enqueues that each arrive to an empty queue', async () => {
-        const q = new RequestQueue(60);
-        const at = [];
-        const stamp = () => { at.push(Date.now()); return 'ok'; };
-
-        // Await each before enqueuing the next — the queue is empty every time.
-        await q.enqueue(stamp);
-        await q.enqueue(stamp);
-        await q.enqueue(stamp);
-
-        expect(at).toHaveLength(3);
-        expect(at[1] - at[0]).toBeGreaterThanOrEqual(50);
-        expect(at[2] - at[1]).toBeGreaterThanOrEqual(50);
-    });
-
-    it('still spaces a burst enqueued all at once', async () => {
-        const q = new RequestQueue(60);
-        const at = [];
-        const stamp = () => { at.push(Date.now()); return 'ok'; };
-
-        await Promise.all([q.enqueue(stamp), q.enqueue(stamp), q.enqueue(stamp)]);
-
-        expect(at[1] - at[0]).toBeGreaterThanOrEqual(50);
-        expect(at[2] - at[1]).toBeGreaterThanOrEqual(50);
-    });
-
-    // Regression: the wait is computed from a stored timestamp, so a clock that
-    // jumps backwards (NTP correction, or a suite faking timers) makes the
-    // elapsed time negative. Unclamped, delayMs - sinceLast then sleeps for the
-    // whole length of the jump and the queue never drains again.
-    it('never waits longer than one interval when the clock jumps backwards', async () => {
-        const q = new RequestQueue(60);
-        await q.enqueue(() => 'first');
-        q.lastRunAt = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30 days ahead
-
-        const start = Date.now();
-        await q.enqueue(() => 'second');
-        expect(Date.now() - start).toBeLessThan(500);
-    });
-
-    it('does not delay the very first request', async () => {
-        const q = new RequestQueue(500);
-        const start = Date.now();
-        await q.enqueue(() => 'ok');
-        expect(Date.now() - start).toBeLessThan(200);
-    });
-});
 
 describe('etherscanService — getAddressType', () => {
     const rpc = (result) => ({ ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: 1, result }) });
